@@ -65,6 +65,11 @@ Avoid running these together:
 - `prism.py` and any other active trading bot: `prism.py` is broad and aggressive.
 - `parallax.py` and any other active trading bot: `parallax.py` is the broadest in the repo.
 - `parallax.py` and `prism.py`: maximum overlap; both fire ETF/basket/sub-ETF/xv arbs.
+- `parallax.py` and `apex_bot.py`: both fire ETF basket arb and cross-venue arb.
+- `apex_bot.py` and any of `fabijan_v1/v2/v3.py`, `edge_trader_bot.py`, `codex_bot.py`,
+  `codex_bot_v2.py`, `namikv1.py`, `alpha_bot.py`, `prism.py`: `apex_bot.py` covers
+  ETF basket arb, cross-venue arb, MM-skew, and EOS unwind — running it next to
+  another arb bot duplicates orders against the same edges and shares cash/positions.
 
 Safe combinations:
 
@@ -121,6 +126,7 @@ Scores are operator scores from 1-10, not guaranteed PnL.
 | `alpha_bot.py` | Yes | MM-skew, non-50 size, CARD/SIMP, adaptive thresholds | 5 | 8 | 9 | 6 | 7 | Advanced experimental |
 | `prism.py` | Yes | Multi-venue ETF/basket/sub-ETF/stock arb + passive MM | 4 | 9 | 10 | 6 | 7 | Highest ambition, highest blast radius |
 | `parallax.py` | Yes | prism edges + consensus FV, vol-adaptive thresholds, stat FV snipe, sector residual ETF-hedged, SH coherence, inv+flow-skewed MM | 4 | 10 | 10 | 5 | 8 | Broadest bot in the repo; highest expected edge but highest blast radius |
+| `apex_bot.py` | Yes | Rule-based ETF basket arb + ZSE oracle cross-venue + MM-skew + EOS unwind | 7 | 8 | 6 | 7 | 8 | New flagship, deterministic ETF edge, untested live |
 | `history_bot.py` | No | Data capture | 10 | N/A | 2 | 9 | 9 | Always useful in tests |
 | `analyzerbot.py` | No | Offline analysis and scoring | 10 | N/A | 2 | 9 | 9 | Run after captures |
 | `dashboard.py` | No | Monitoring UI | 8 | N/A | 4 | 7 | 7 | Useful if connection budget permits |
@@ -702,6 +708,109 @@ Admin score: 8/10 overall, 4/10 safety. Highest expected edge in the repo
 on paper, but the broadest blast radius. Run on a small venue subset before
 expanding.
 
+### `apex_bot.py`
+
+Purpose: single-file multi-strategy bot built around the deterministic ETF
+rule (FV = mean of constituents). Strategies, in priority order:
+
+1. Same-exchange ETF basket arb (model-free, IOC).
+2. ZSE-anchored cross-venue ETF arb (ZSE is the only venue listing all 25
+   instruments, so its basket math is the universal oracle).
+3. ZSE-anchored cross-venue stock arb, latency-budgeted.
+4. MM inventory-skew passive harvesting around basket fair (only on the
+   co-located venue or ZSE).
+5. Convergence holding clock — force-exit arb lots that don't unwind in 9 s.
+6. End-of-segment unwind in the last 30 s (cancel resting orders, IOC-close
+   exposure; settlement is a weighted close, not edge).
+
+Operational features:
+
+- Auto-detects the co-located exchange via `/health` RTT every 30 s. No config
+  edits needed when the team rotates between segments.
+- Token-bucket rate limiter at 380 msg/s (76 % of the 500 cap) — burst-tolerant.
+- Distinguishes `end_of_round` (resets state, jittered staggered reconnect)
+  from a mid-segment WS drop (preserves state, re-syncs via `get_inventory`).
+- Self-fill detection counts only the passive side of trade events to avoid
+  double-counting fills already attributed by `add_order_response.immediate_*`.
+- Reserved-cash and reserved-position estimates from local live orders cover
+  the 5-second window between authoritative inventory syncs.
+
+Dry run (no orders sent):
+
+```bash
+APEX_DRY_RUN=1 APEX_LOG=INFO python3 apex_bot.py
+```
+
+Live run, all 10 exchanges:
+
+```bash
+tmux new -s apex
+python3 apex_bot.py
+```
+
+Live run, subset of exchanges:
+
+```bash
+APEX_EXCHANGES=zse,nyse,hkex,euronext,tmx python3 apex_bot.py
+```
+
+Selectively disable strategies (e.g. for triage):
+
+```bash
+APEX_DISABLE=mm_skew,cross_venue_stock_arb python3 apex_bot.py
+```
+
+Verbose debug:
+
+```bash
+APEX_LOG=DEBUG python3 apex_bot.py
+```
+
+Flags (env vars):
+
+| Env | Default | Meaning |
+|---|---|---|
+| `APEX_DRY_RUN` | `0` | `1` logs every order/cancel instead of sending |
+| `APEX_LOG` | `INFO` | `DEBUG`, `INFO`, `WARNING` |
+| `APEX_EXCHANGES` | all 10 | Comma-separated subset (e.g. `zse,nyse`) |
+| `APEX_DISABLE` | none | Comma-separated strategy names to skip |
+
+Strategy names for `APEX_DISABLE`:
+
+```text
+etf_basket_arb, zse_anchored_etf_arb, cross_venue_stock_arb,
+mm_skew, convergence_clock, eos_unwind
+```
+
+Important constants in file:
+
+```text
+SAFE_MSGS_PER_SEC=380       # of 500 hard cap
+ARB_MIN_EDGE_CENTS=4        # same-exchange ETF arb threshold
+ARB_CROSS_VENUE_BASE_EDGE=12  # cross-venue ETF/stock arb threshold
+SKEW_MIN_CENTS=4            # MM-skew passive trigger
+ARB_CLIP_QTY=8              # shares per IOC arb fill
+SKEW_CLIP_QTY=4             # shares per passive MM quote
+MAX_POS_LONG=80             # soft long cap per instrument
+MAX_POS_SHORT=-60           # soft short cap (vs −200 wall)
+CONVERGENCE_HOLD_MS=9000    # forced unwind clock
+EOS_UNWIND_LEAD_MS=30000    # start unwinding 30s before close
+```
+
+Operator notes:
+
+- The bot is **always live** — there is no `LIVE_TRADING` gate. Use
+  `APEX_DRY_RUN=1` for observe-only.
+- Skip co-locating with `prism.py`, `fabijan_v*.py`, `edge_trader_bot.py`,
+  `codex_bot*.py`, `namikv1.py`, or `alpha_bot.py`. They contend for the
+  same edges and the team account is shared by source IP.
+- Pairs cleanly with `history_bot.py` and `dashboard.py` (read-only).
+- Logs at INFO are quiet by design — only connect/disconnect/co-location
+  events. Use `APEX_LOG=DEBUG` to see strategy-level decisions.
+
+Admin score: 8/10. Strongest theoretical edge in the repo (rule-based ETF
+mean reversion), but never run live. Watch the first segment closely.
+
 ### `dashboard.py`
 
 Purpose: local monitoring dashboard, not a trading bot.
@@ -857,6 +966,7 @@ Use this during a round:
 | You want broad alpha and can monitor closely | `codex_bot.py`, `codex_bot_v2.py`, `namikv1.py`, `namikv2.py`, or `alpha_bot.py` |
 | You want maximum ambition and accept risk | `prism.py --venues ...` |
 | You want broader-than-prism alpha with consensus FV, stat snipes, and inventory-skewed MM | `parallax.py --venues ...` |
+| You want the deterministic ETF edge with auto co-location | `apex_bot.py` (dry-run first) |
 | You are in a testing round | `history_bot.py` + `analyzerbot.py` |
 | Official dashboard is poor | `dashboard.py` |
 | You need a C++ starting point | `demo_bot.cpp`; use `bot.cpp` only after a small-venue build check |
@@ -892,6 +1002,7 @@ Manual score sheet:
 | `codex_bot.py` |  |  |  |  |  |  |  |
 | `alpha_bot.py` |  |  |  |  |  |  |  |
 | `prism.py` |  |  |  |  |  |  |  |
+| `apex_bot.py` |  |  |  |  |  |  |  |
 
 ## 8. Shutdown
 
