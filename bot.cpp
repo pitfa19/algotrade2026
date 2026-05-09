@@ -367,88 +367,6 @@ public:
  */
 #include <unordered_set>
 
-class SimpleStrategy : public Strategy {
-public:
-    void on_connected(Bot& bot, const std::string& exchange) override {
-        (void)bot;
-        std::cout << "[SimpleStrategy] Connected to " << exchange << "\n";
-    }
-
-    void on_market_data(Bot& bot,
-                        const std::string& exchange,
-                        const MarketState& state) override {
-
-        auto nyse_instruments = state.instruments_on("NYSE");
-        auto exec_instruments = state.instruments_on(exchange);
-
-        if (nyse_instruments.empty() || exec_instruments.empty())
-            return;
-
-        std::unordered_set<std::string> nyse_set(
-            nyse_instruments.begin(),
-            nyse_instruments.end()
-        );
-
-        for (const auto& symbol : exec_instruments) {
-
-            if (!nyse_set.count(symbol))
-                continue;
-
-            auto nyse = state.get_book("NYSE", symbol);
-            auto exec_book = state.get_book(exchange, symbol);
-
-            if (!nyse || !exec_book)
-                continue;
-
-            auto n_bid = nyse->best_bid();
-            auto n_ask = nyse->best_ask();
-
-            auto e_bid = exec_book->best_bid();
-            auto e_ask = exec_book->best_ask();
-
-            if (!n_bid || !n_ask || !e_bid || !e_ask)
-                continue;
-
-            double nyse_mid = (*n_bid + *n_ask) * 0.5;
-            double exec_mid = (*e_bid + *e_ask) * 0.5;
-
-            double diff = nyse_mid - exec_mid;
-
-            const double threshold = 0.05;
-            int qty = 100;
-
-            // BUY signal: exec is cheaper than NYSE
-            if (diff > threshold) {
-                int price = *e_ask; // buy at ask
-                bot.place_order(exchange, symbol, "buy", price, qty);
-            }
-
-            // SELL signal: exec is more expensive than NYSE
-            if (diff < -threshold) {
-                int price = *e_bid; // sell at bid
-                bot.place_order(exchange, symbol, "sell", price, qty);
-            }
-        }
-    }
-
-    void on_fill(Bot& bot, const Fill& fill) override {
-        (void)bot;
-        std::cout << "[SimpleStrategy] FILL "
-                  << fill.exchange << " "
-                  << fill.instrument_id << " "
-                  << fill.quantity << "@" << fill.price << "\n";
-    }
-
-    void on_round_end(Bot& bot, const std::string& exchange) override {
-        (void)bot;
-        std::cout << "[SimpleStrategy] Round ended on " << exchange << "\n";
-    }
-};
-
-
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-//  Utility
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 static int64_t now_ms() {
     using namespace std::chrono;
@@ -456,15 +374,6 @@ static int64_t now_ms() {
         system_clock::now().time_since_epoch()).count();
 }
 
-
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-//  Exchange Connection (Boost.Beast synchronous WebSocket)
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-/**
- * Manages a single WebSocket connection to one exchange.
- * Uses Boost.Beast for WebSocket I/O (synchronous, run in a dedicated thread).
- */
 class ExchangeConnection {
 public:
     ExchangeConnection(const std::string& name, const std::string& host,
@@ -560,7 +469,7 @@ public:
             {"price",           price},
             {"expiry",          now_ms() + expiry_ms},
             {"side",            side},
-            {"quantity",        quantity},
+            {"quantity",        quantity}
         };
         return send(msg);
     }
@@ -602,22 +511,6 @@ private:
     int request_counter_ = 0;
 };
 
-
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-//  Bot â€” Main Orchestrator
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-/**
- * Main bot orchestrator.
- *
- * Manages connections to multiple exchanges, maintains the aggregated
- * MarketState, and dispatches events to the plugged-in Strategy.
- *
- * Usage:
- *     auto strategy = std::make_unique<SimpleStrategy>();
- *     Bot bot(std::move(strategy));
- *     bot.run(); // blocks until round ends or interrupted
- */
 class Bot {
 public:
     explicit Bot(std::unique_ptr<Strategy> strategy)
@@ -827,53 +720,107 @@ private:
     std::atomic<bool> running_{false};
 };
 
+class SimpleStrategy : public Strategy {
+public:
+    void on_connected(Bot& bot, const std::string& exchange) override {
+        (void)bot;
+        std::cout << "[SimpleStrategy] Connected to " << exchange << "\n";
+    }
 
-inline void SimpleStrategy::on_market_data(Bot& bot,
-                                           const std::string& exchange,
-                                           const MarketState& state) {
-    auto nyse_instruments = state.instruments_on("NYSE");
-    auto exec_instruments = state.instruments_on(exchange);
+    void on_market_data(Bot& bot,
+                        const std::string& exchange,
+                        const MarketState& state) override {
 
-    if (nyse_instruments.empty() || exec_instruments.empty())
-        return;
+        auto nyse_instruments = state.instruments_on("NYSE");
+        auto exec_instruments = state.instruments_on(exchange);
 
-    std::unordered_set<std::string> nyse_set(
-        nyse_instruments.begin(),
-        nyse_instruments.end()
-    );
+        if (nyse_instruments.empty() || exec_instruments.empty())
+            return;
 
-    for (const auto& symbol : exec_instruments) {
-        if (!nyse_set.count(symbol))
-            continue;
+        std::unordered_set<std::string> nyse_set(
+            nyse_instruments.begin(),
+            nyse_instruments.end()
+        );
 
-        auto nyse = state.get_book("NYSE", symbol);
-        auto exec_book = state.get_book(exchange, symbol);
+        for (const auto& symbol : exec_instruments) {
+            if (!nyse_set.count(symbol))
+                continue;
 
-        if (!nyse || !exec_book)
-            continue;
+            auto nyse = state.get_book("NYSE", symbol);
+            auto exec_book = state.get_book(exchange, symbol);
 
-        auto n_bid = nyse->best_bid();
-        auto n_ask = nyse->best_ask();
-        auto e_bid = exec_book->best_bid();
-        auto e_ask = exec_book->best_ask();
+            if (!nyse || !exec_book)
+                continue;
 
-        if (!n_bid || !n_ask || !e_bid || !e_ask)
-            continue;
+            auto n_bid = nyse->best_bid();
+            auto n_ask = nyse->best_ask();
+            auto e_bid = exec_book->best_bid();
+            auto e_ask = exec_book->best_ask();
 
-        double nyse_mid = (*n_bid + *n_ask) * 0.5;
-        double exec_mid = (*e_bid + *e_ask) * 0.5;
-        double diff = nyse_mid - exec_mid;
+            if (!n_bid || !n_ask || !e_bid || !e_ask)
+                continue;
 
-        const double threshold = 0.05;
+            double nyse_mid = (*n_bid + *n_ask) * 0.5;
+            double exec_mid = (*e_bid + *e_ask) * 0.5;
+            double diff = nyse_mid - exec_mid;
 
-        if (diff > threshold) {
-            bot.place_order(exchange, symbol, "buy", *e_ask, 100);
-        }
-        if (diff < -threshold) {
-            bot.place_order(exchange, symbol, "sell", *e_bid, 100);
+            const double threshold = 0.05;
+
+            if (diff > threshold) {
+                bot.place_order(exchange, symbol, "buy", *e_ask, 100);
+            }
+            if (diff < -threshold) {
+                bot.place_order(exchange, symbol, "sell", *e_bid, 100);
+            }
         }
     }
-}
+
+    void on_fill(Bot& bot, const Fill& fill) override {
+        (void)bot;
+        std::cout << "[SimpleStrategy] FILL "
+                  << fill.exchange << " "
+                  << fill.instrument_id << " "
+                  << fill.quantity << "@" << fill.price << "\n";
+    }
+
+    void on_round_end(Bot& bot, const std::string& exchange) override {
+        (void)bot;
+        std::cout << "[SimpleStrategy] Round ended on " << exchange << "\n";
+    }
+};
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Utility
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Exchange Connection (Boost.Beast synchronous WebSocket)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * Manages a single WebSocket connection to one exchange.
+ * Uses Boost.Beast for WebSocket I/O (synchronous, run in a dedicated thread).
+ */
+
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  Bot â€” Main Orchestrator
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * Main bot orchestrator.
+ *
+ * Manages connections to multiple exchanges, maintains the aggregated
+ * MarketState, and dispatches events to the plugged-in Strategy.
+ *
+ * Usage:
+ *     auto strategy = std::make_unique<SimpleStrategy>();
+ *     Bot bot(std::move(strategy));
+ *     bot.run(); // blocks until round ends or interrupted
+ */
 
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
