@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+make_minimum_required(VERSION 3.16)
 project(algotrade_demo_bot LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
