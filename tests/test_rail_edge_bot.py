@@ -32,8 +32,8 @@ class RailEdgeStrategyTests(unittest.TestCase):
         strategy = RailEdgeStrategy(config)
 
         orders = strategy.plan_orders(state, depth=None, now_ms=1_000)
-        bids = [o for o in orders if o["side"] == "bid"]
-        asks = [o for o in orders if o["side"] == "ask"]
+        bids = [o for o in orders if o.get("side") == "bid"]
+        asks = [o for o in orders if o.get("side") == "ask"]
         self.assertEqual(len(bids), 1)
         self.assertEqual((bids[0]["price"], bids[0]["quantity"]),
                          (config.low_bid_price, config.lot_size))
@@ -54,7 +54,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
         state = synced_state(exchange="NASDAQ")
         strategy = RailEdgeStrategy(config)
         orders = strategy.plan_orders(state, depth=None, now_ms=1_000)
-        asks = [o for o in orders if o["side"] == "ask"]
+        asks = [o for o in orders if o.get("side") == "ask"]
         self.assertEqual(len(asks), 1)
         self.assertEqual(asks[0]["price"], config.high_ask_price)
 
@@ -71,7 +71,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
         )
         strategy = RailEdgeStrategy(config)
         orders = strategy.plan_orders(state, depth=None, now_ms=2_000)
-        bids = [o for o in orders if o["side"] == "bid"]
+        bids = [o for o in orders if o.get("side") == "bid"]
         self.assertEqual(bids, [])
 
     def test_long_inventory_places_high_rail_ask_when_explicitly_enabled(self):
@@ -92,7 +92,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
         strategy = RailEdgeStrategy(config)
 
         orders = strategy.plan_orders(state, depth=None, now_ms=1_500)
-        asks = [order for order in orders if order["side"] == "ask"]
+        asks = [order for order in orders if order.get("side") == "ask"]
         self.assertEqual(len(asks), 1)
         self.assertEqual(asks[0]["price"], config.high_ask_price)
         self.assertEqual(asks[0]["quantity"], config.lot_size)
@@ -105,7 +105,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
             order_id=42,
             instrument="NASDAQ-CARD",
             side="bid",
-            price=7001,
+            price=config.low_bid_price,
             quantity=500,
             role="rail",
         )
@@ -141,11 +141,11 @@ class RailEdgeStrategyTests(unittest.TestCase):
             now_ms=2_000,
         )
 
-        close_orders = [order for order in orders if order["order_type"] == "ioc"]
+        close_orders = [order for order in orders if order.get("order_type") == "ioc"]
         limit_asks = [
             order
             for order in orders
-            if order["side"] == "ask" and order["order_type"] == "limit"
+            if order.get("side") == "ask" and order.get("order_type") == "limit"
         ]
         self.assertEqual(len(close_orders), 1)
         self.assertEqual(close_orders[0]["side"], "ask")
@@ -177,7 +177,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
             now_ms=3_000,
         )
 
-        close_orders = [order for order in orders if order["order_type"] == "ioc"]
+        close_orders = [order for order in orders if order.get("order_type") == "ioc"]
         self.assertEqual(len(close_orders), 1)
         self.assertEqual(close_orders[0]["side"], "bid")
         self.assertEqual(close_orders[0]["price"], config.close_ask_max)
@@ -196,14 +196,14 @@ class RailEdgeStrategyTests(unittest.TestCase):
             order_id=7,
             instrument="NASDAQ-CARD",
             side="bid",
-            price=7001,
+            price=config.low_bid_price,
             quantity=100,
             role="rail",
         )
         strategy = RailEdgeStrategy(config)
 
         orders = strategy.plan_orders(state, depth=None, now_ms=4_000)
-        bids = [order for order in orders if order["side"] == "bid"]
+        bids = [order for order in orders if order.get("side") == "bid"]
 
         # cash floor is -50k; available = cash - pending - CASH_FLOOR
         self.assertEqual(len(bids), 1)
@@ -218,7 +218,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
         strategy = RailEdgeStrategy(config)
 
         orders = strategy.plan_orders(state, depth=None, now_ms=4_500)
-        bids = [order for order in orders if order["side"] == "bid"]
+        bids = [order for order in orders if order.get("side") == "bid"]
 
         self.assertEqual(bids, [])
 
@@ -239,7 +239,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
         strategy = RailEdgeStrategy(config)
 
         orders = strategy.plan_orders(state, depth=None, now_ms=5_000)
-        bids = [order for order in orders if order["side"] == "bid"]
+        bids = [order for order in orders if order.get("side") == "bid"]
 
         self.assertEqual(bids, [])
 
@@ -256,7 +256,7 @@ class CashReservationTests(unittest.TestCase):
         state.apply_inventory({"$": [15_000_000, 10_000_000]})
         strategy = RailEdgeStrategy(config)
         orders = strategy.plan_orders(state, depth=None, now_ms=1_000)
-        bids = [o for o in orders if o["side"] == "bid"]
+        bids = [o for o in orders if o.get("side") == "bid"]
         self.assertEqual(bids, [])
 
     def test_inventory_total_field_is_what_drives_cash(self):
