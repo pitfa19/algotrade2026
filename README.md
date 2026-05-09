@@ -31,3 +31,30 @@ python bot.py
 
 `LOG_LEVEL=DEBUG` for verbose order logs. `ZSE_HOST` overrides the host (e.g.
 to the IP `10.0.210.2`) if DNS misbehaves.
+
+## Self-dashboard
+
+The official `dashboard.algotrade.hr` UI is unreliable. `dashboard.py` is a
+local replacement that connects one WebSocket to each of the 10 exchanges,
+polls `get_inventory` / `get_pending_orders` once a second, and serves a
+small web UI.
+
+```sh
+pip install -r requirements.txt
+python dashboard.py            # http://localhost:8080
+PORT=9000 python dashboard.py  # override port
+```
+
+What it shows:
+
+- Total NAV / PnL across all 10 exchanges (NAV = cash + Σ position × mid)
+- Per-exchange status, cash, NAV, PnL, open positions, pending orders,
+  segment time remaining
+- Live order-book viewer (any instrument on any exchange)
+- Filterable feed of recent trade / cancel events
+
+Caveats: there is **no public leaderboard API** at AlgoTrade — order books
+are aggregated/anonymous and trade events carry no team ID. The "score"
+shown is your own NAV minus initial capital, which is exactly what the
+official scoring formula is computed from. Each WS counts against the
+per-exchange connection cap (10), so leave headroom if you also run a bot.
