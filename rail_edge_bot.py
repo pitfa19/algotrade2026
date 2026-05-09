@@ -75,6 +75,11 @@ class RailConfig:
     # market order. The rail edge was already locked in at the rail-fill price;
     # this just frees capital for the next cycle.
     force_close_after_ms: int = 5_000
+    # If no fill has hit in this many ms AND we still have inventory or
+    # live orders, BOOM: cancel every live order + market-flatten every
+    # non-zero position. Then a short cooldown before the rails re-arm.
+    boom_after_ms: int = 8_000
+    boom_cooldown_ms: int = 1_500
 
     @property
     def instrument(self) -> str:
@@ -121,6 +126,13 @@ class ExchangeState:
     last_flat_ms: dict[str, int] = field(default_factory=dict)
     inventory_synced: bool = False
     pending_orders_synced: bool = False
+    # Last server time at which we registered a fill (any path). Used by
+    # the boom-cycle: if this hasn't moved in `boom_after_ms`, the bot
+    # nukes everything and starts fresh.
+    last_fill_ms: int = 0
+    # Server time until which the rails should NOT re-arm — set by a boom
+    # so the dust settles before we go again.
+    boom_cooldown_until_ms: int = 0
 
     def position(self, instrument: str) -> int:
         return int(self.positions.get(instrument, 0))
@@ -307,6 +319,10 @@ class RailEdgeStrategy:
             state.positions[order.instrument] = state.position(order.instrument) - quantity
             state.cash += price * quantity
 
+        ev_time = data.get("time")
+        if isinstance(ev_time, int):
+            state.last_fill_ms = max(state.last_fill_ms, ev_time)
+
         order.remaining -= quantity
         if order.remaining <= 0:
             state.drop_order(order.order_id)
@@ -325,6 +341,9 @@ class RailEdgeStrategy:
             )
         if cash_change is not None:
             state.cash += int(cash_change)
+        # Nudge last_fill forward against monotonic clock so the boom-cycle
+        # debouncer treats this tick as "we made progress".
+        state.last_fill_ms = int(time.time() * 1000)
 
     def plan_orders(
         self,
@@ -340,6 +359,12 @@ class RailEdgeStrategy:
 
         instrument = self.config.instrument
         orders: list[dict[str, Any]] = []
+
+        # 0. BOOM cycle. If fills have stopped while we still have
+        #    inventory or live orders, blow it all away and start fresh.
+        boom = self._plan_boom(state, now_ms)
+        if boom:
+            return boom  # don't re-arm rails this tick
 
         # 1. Force-flatten if inventory has been held past the timeout.
         force_close = self._plan_force_close(state, now_ms)
@@ -363,8 +388,9 @@ class RailEdgeStrategy:
             else:
                 extra_bid_value += int(o["quantity"]) * int(o.get("price") or 0)
 
-        # 3. Re-arm rails.
-        bid_qty = self._rail_bid_quantity(state, extra_bid_value)
+        # 3. Re-arm rails — but skip while a boom is cooling down.
+        in_cooldown = now_ms < state.boom_cooldown_until_ms
+        bid_qty = 0 if in_cooldown else self._rail_bid_quantity(state, extra_bid_value)
         if bid_qty > 0:
             orders.append(
                 self._order(
@@ -374,7 +400,7 @@ class RailEdgeStrategy:
                 )
             )
 
-        ask_qty = self._rail_ask_quantity(state, extra_ask_qty)
+        ask_qty = 0 if in_cooldown else self._rail_ask_quantity(state, extra_ask_qty)
         if ask_qty > 0:
             orders.append(
                 self._order(
@@ -385,6 +411,63 @@ class RailEdgeStrategy:
             )
 
         return orders
+
+    def _plan_boom(
+        self, state: ExchangeState, now_ms: int
+    ) -> list[dict[str, Any]]:
+        """If fills have stopped flowing while inventory or live orders
+        remain, NUKE everything and let the rails re-arm fresh.
+
+        - Trigger: now − last_fill_ms > boom_after_ms AND (any non-zero
+          position OR any live order on this instrument).
+        - Action: cancel every live order on this instrument + a single
+          market order per non-zero position to flatten.
+        - Debounce: bump last_fill_ms to now and set a cooldown window so
+          rails do not immediately stack back into the same trap.
+        """
+        # First-time bootstrap: anchor the timer so we don't insta-boom
+        # before any market data has arrived.
+        if state.last_fill_ms == 0:
+            state.last_fill_ms = int(now_ms)
+            return []
+        if int(now_ms) < state.boom_cooldown_until_ms:
+            return []
+        if int(now_ms) - state.last_fill_ms < int(self.config.boom_after_ms):
+            return []
+
+        instrument = self.config.instrument
+        pos = state.position(instrument)
+        live_for_inst = [o for o in state.live_orders.values()
+                         if o.instrument == instrument]
+        if pos == 0 and not live_for_inst:
+            return []  # nothing to nuke
+
+        actions: list[dict[str, Any]] = []
+        # 1. Cancel every live order on this instrument.
+        for o in live_for_inst:
+            actions.append({
+                "type": "cancel_order",
+                "order_id": int(o.order_id),
+                "instrument_id": instrument,
+                "role": "boom_cancel",
+            })
+        # 2. Flatten the position with a market order.
+        if pos > 0:
+            actions.append(self._order(
+                instrument=instrument, side="ask", price=0,
+                quantity=pos, order_type="market", role="boom_flatten",
+            ))
+        elif pos < 0:
+            actions.append(self._order(
+                instrument=instrument, side="bid", price=0,
+                quantity=-pos, order_type="market", role="boom_flatten",
+            ))
+
+        # debounce: don't re-trigger every tick while the cancels/flatten
+        # are still ack'ing back; reset the progress timer.
+        state.last_fill_ms = int(now_ms)
+        state.boom_cooldown_until_ms = int(now_ms) + int(self.config.boom_cooldown_ms)
+        return actions
 
     def _plan_force_close(
         self, state: ExchangeState, now_ms: int
@@ -695,17 +778,31 @@ class RailEdgeBot:
                         depths = message.get("orderbook_depths", {})
                         depth = depths.get(config.instrument)
                         planned = strategy.plan_orders(state, depth, now_ms)
-                        for order in planned:
+                        for action in planned:
                             seq += 1
-                            request_id = f"{exchange}-{seq}-{order['role']}"
+                            request_id = f"{exchange}-{seq}-{action['role']}"
+                            if action.get("type") == "cancel_order":
+                                # boom path: drop the live order locally
+                                # immediately so the next planning pass
+                                # doesn't see it.
+                                state.drop_order(int(action["order_id"]))
+                                await self._send_json(
+                                    ws, limiter,
+                                    build_cancel_order(
+                                        request_id=request_id,
+                                        instrument_id=action["instrument_id"],
+                                        order_id=int(action["order_id"]),
+                                    ),
+                                )
+                                continue
                             pending_order = PendingOrder(
                                 local_id=request_id,
-                                instrument=order["instrument_id"],
-                                side=order["side"],
-                                price=order["price"],
-                                quantity=order["quantity"],
-                                order_type=order["order_type"],
-                                role=order["role"],
+                                instrument=action["instrument_id"],
+                                side=action["side"],
+                                price=action["price"],
+                                quantity=action["quantity"],
+                                order_type=action["order_type"],
+                                role=action["role"],
                             )
                             pending[request_id] = pending_order
                             state.track_inflight(pending_order)
@@ -714,11 +811,11 @@ class RailEdgeBot:
                                 limiter,
                                 build_add_order(
                                     request_id=request_id,
-                                    instrument_id=order["instrument_id"],
-                                    side=order["side"],
-                                    price=order["price"],
-                                    quantity=order["quantity"],
-                                    order_type=order["order_type"],
+                                    instrument_id=action["instrument_id"],
+                                    side=action["side"],
+                                    price=action["price"],
+                                    quantity=action["quantity"],
+                                    order_type=action["order_type"],
                                     ttl_ms=self.order_ttl_ms,
                                 ),
                             )

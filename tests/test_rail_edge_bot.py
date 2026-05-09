@@ -256,6 +256,50 @@ class CashReservationTests(unittest.TestCase):
         self.assertEqual(state.cash, 8_000_000)
 
 
+class BoomCycleTests(unittest.TestCase):
+    def test_no_boom_when_fills_recent(self):
+        config = default_rail_configs()["NASDAQ"]
+        state = synced_state(exchange="NASDAQ")
+        state.positions["NASDAQ-CARD"] = 500
+        state.last_fill_ms = 10_000
+        strategy = RailEdgeStrategy(config)
+        orders = strategy.plan_orders(state, depth=None,
+                                      now_ms=10_000 + config.boom_after_ms - 1)
+        self.assertFalse(any(o.get("role", "").startswith("boom") for o in orders))
+
+    def test_boom_cancels_live_orders_and_market_flattens(self):
+        config = default_rail_configs()["NASDAQ"]
+        state = synced_state(exchange="NASDAQ")
+        state.positions["NASDAQ-CARD"] = 350
+        state.last_fill_ms = 1_000
+        # one live rail bid + one live rail ask we should cancel
+        state.track_order(local_id="b1", order_id=11, instrument="NASDAQ-CARD",
+                          side="bid", price=config.low_bid_price, quantity=200, role="rail")
+        state.track_order(local_id="a1", order_id=22, instrument="NASDAQ-CARD",
+                          side="ask", price=config.high_ask_price, quantity=200, role="rail")
+        strategy = RailEdgeStrategy(config)
+        now = 1_000 + config.boom_after_ms + 100
+        orders = strategy.plan_orders(state, depth=None, now_ms=now)
+        cancels = [o for o in orders if o.get("type") == "cancel_order"]
+        flattens = [o for o in orders if o.get("role") == "boom_flatten"]
+        self.assertEqual({c["order_id"] for c in cancels}, {11, 22})
+        self.assertEqual(len(flattens), 1)
+        self.assertEqual(flattens[0]["side"], "ask")
+        self.assertEqual(flattens[0]["order_type"], "market")
+        self.assertEqual(flattens[0]["quantity"], 350)
+        # cooldown is set so the next tick doesn't immediately re-arm rails
+        self.assertGreater(state.boom_cooldown_until_ms, now)
+
+    def test_boom_skipped_when_no_inventory_and_no_live_orders(self):
+        config = default_rail_configs()["NASDAQ"]
+        state = synced_state(exchange="NASDAQ")
+        state.last_fill_ms = 1_000
+        strategy = RailEdgeStrategy(config)
+        orders = strategy.plan_orders(state, depth=None,
+                                      now_ms=1_000 + config.boom_after_ms + 100)
+        self.assertFalse(any(o.get("role", "").startswith("boom") for o in orders))
+
+
 class ForceCloseTests(unittest.TestCase):
     def test_long_inventory_force_closes_with_market_after_timeout(self):
         config = default_rail_configs()["NASDAQ"]
