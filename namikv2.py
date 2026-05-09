@@ -58,13 +58,13 @@ except ImportError:
 # Universe (unchanged from v1)
 # ════════════════════════════════════════════════════════════════════════════
 
-VENUES = ["NYSE", "NASDAQ", "SSE", "JPX", "Euronext", "LSE", "HKEX", "NSE", "TMX", "ZSE"]
+VENUES = ["NYSE", "NASDAQ", "SSE", "JPX", "EURONEXT", "LSE", "HKEX", "NSE", "TMX", "ZSE"]
 WS_HOSTS = {
     "NYSE":     "nyse.algotrade.hr",
     "NASDAQ":   "nasdaq.algotrade.hr",
     "SSE":      "sse.algotrade.hr",
     "JPX":      "jpx.algotrade.hr",
-    "Euronext": "euronext.algotrade.hr",
+    "EURONEXT": "euronext.algotrade.hr",
     "LSE":      "lse.algotrade.hr",
     "HKEX":     "hkex.algotrade.hr",
     "NSE":      "nse.algotrade.hr",
@@ -76,7 +76,7 @@ WS_HOSTS = {
 # Within-cluster RTT is small; across is 80-180ms, which costs us drift.
 CLUSTERS = {
     "NA":   {"NYSE", "NASDAQ", "TMX"},
-    "EU":   {"LSE", "Euronext"},
+    "EU":   {"LSE", "EURONEXT"},
     "ASIA": {"JPX", "HKEX", "SSE"},
     "IN":   {"NSE"},
     "ZSE":  {"ZSE"},
@@ -84,31 +84,31 @@ CLUSTERS = {
 CLUSTER_OF = {v: c for c, vs in CLUSTERS.items() for v in vs}
 
 LISTINGS: dict[str, set[str]] = {
-    "CARD":  {"NYSE","NASDAQ","LSE","Euronext","JPX","SSE","HKEX","NSE","TMX","ZSE"},
-    "SIMP":  {"NYSE","NASDAQ","LSE","Euronext","JPX","SSE","HKEX","NSE","TMX","ZSE"},
-    "NGUP":  {"NYSE","NASDAQ","Euronext","TMX","ZSE"},
-    "OIT":   {"LSE","Euronext","HKEX","NSE","ZSE"},
+    "CARD":  {"NYSE","NASDAQ","LSE","EURONEXT","JPX","SSE","HKEX","NSE","TMX","ZSE"},
+    "SIMP":  {"NYSE","NASDAQ","LSE","EURONEXT","JPX","SSE","HKEX","NSE","TMX","ZSE"},
+    "NGUP":  {"NYSE","NASDAQ","EURONEXT","TMX","ZSE"},
+    "OIT":   {"LSE","EURONEXT","HKEX","NSE","ZSE"},
     "KTST":  {"NYSE","JPX","TMX","ZSE"},
     "FSR":   {"NASDAQ","LSE","SSE","HKEX","ZSE"},
-    "JZRO":  {"NYSE","LSE","Euronext","TMX","ZSE"},
+    "JZRO":  {"NYSE","LSE","EURONEXT","TMX","ZSE"},
     "XFR":   {"NYSE","HKEX","TMX","ZSE"},
-    "KOTD":  {"NASDAQ","LSE","Euronext","HKEX","ZSE"},
-    "INA":   {"NYSE","NASDAQ","Euronext","HKEX","ZSE"},
+    "KOTD":  {"NASDAQ","LSE","EURONEXT","HKEX","ZSE"},
+    "INA":   {"NYSE","NASDAQ","EURONEXT","HKEX","ZSE"},
     "HT":    {"NASDAQ","LSE","JPX","SSE","TMX","ZSE"},
-    "JNAF":  {"NYSE","Euronext","JPX","HKEX","ZSE"},
+    "JNAF":  {"NYSE","EURONEXT","JPX","HKEX","ZSE"},
     "DLKV":  {"NASDAQ","LSE","HKEX","NSE","ZSE"},
-    "DDJH":  {"NYSE","LSE","Euronext","TMX","ZSE"},
+    "DDJH":  {"NYSE","LSE","EURONEXT","TMX","ZSE"},
     "MDKA":  {"NYSE","LSE","HKEX","TMX","ZSE"},
-    "KRAS":  {"NYSE","Euronext","SSE","TMX","ZSE"},
-    "ZITO":  {"NASDAQ","LSE","Euronext","NSE","ZSE"},
+    "KRAS":  {"NYSE","EURONEXT","SSE","TMX","ZSE"},
+    "ZITO":  {"NASDAQ","LSE","EURONEXT","NSE","ZSE"},
     "ZABA":  {"NYSE","LSE","SSE","NSE","TMX","ZSE"},
-    "GOLD":  {"NASDAQ","Euronext","JPX","TMX","ZSE"},
-    "XAG":   {"LSE","Euronext","JPX","ZSE"},
-    "ETFA":  {"NYSE","Euronext","HKEX","ZSE"},
+    "GOLD":  {"NASDAQ","EURONEXT","JPX","TMX","ZSE"},
+    "XAG":   {"LSE","EURONEXT","JPX","ZSE"},
+    "ETFA":  {"NYSE","EURONEXT","HKEX","ZSE"},
     "ETFB":  {"NASDAQ","LSE","HKEX","ZSE"},
     "ETFA3": {"NYSE","TMX","ZSE"},
     "ETFB3": {"NASDAQ","HKEX","ZSE"},
-    "ETFSH": {"Euronext","JPX","ZSE"},
+    "ETFSH": {"EURONEXT","JPX","ZSE"},
 }
 ETF_BASKETS = {
     "ETFA":  ["NGUP", "OIT", "KTST", "FSR", "JZRO", "XFR"],
