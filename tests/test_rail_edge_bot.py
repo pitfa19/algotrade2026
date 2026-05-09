@@ -13,7 +13,7 @@ from rail_edge_bot import (
 
 
 class RailEdgeStrategyTests(unittest.TestCase):
-    def test_flat_account_places_standing_bid_and_ask_inside_rails(self):
+    def test_flat_account_places_only_cash_backed_standing_bid(self):
         config = RailConfig(
             exchange="NASDAQ",
             symbol="CARD",
@@ -26,17 +26,30 @@ class RailEdgeStrategyTests(unittest.TestCase):
         strategy = RailEdgeStrategy(config)
 
         orders = strategy.plan_orders(state, depth=None, now_ms=1_000)
+        asks = [order for order in orders if order["side"] == "ask"]
 
         self.assertEqual(
             [
                 (orders[0]["side"], orders[0]["price"], orders[0]["quantity"], orders[0]["order_type"]),
-                (orders[1]["side"], orders[1]["price"], orders[1]["quantity"], orders[1]["order_type"]),
             ],
             [
-                ("bid", 7001, 2000, "limit"),
-                ("ask", 11000, 200, "limit"),
+                ("bid", 7001, 1428, "limit"),
             ],
         )
+        self.assertEqual(asks, [])
+
+    def test_long_inventory_places_high_rail_ask_up_to_owned_inventory(self):
+        config = default_rail_configs()["NASDAQ"]
+        state = ExchangeState(exchange="NASDAQ")
+        state.positions["NASDAQ-CARD"] = 350
+        strategy = RailEdgeStrategy(config)
+
+        orders = strategy.plan_orders(state, depth=None, now_ms=1_500)
+        asks = [order for order in orders if order["side"] == "ask"]
+
+        self.assertEqual(len(asks), 1)
+        self.assertEqual(asks[0]["price"], 11000)
+        self.assertEqual(asks[0]["quantity"], 350)
 
     def test_passive_rail_fill_updates_position_cash_and_remaining_order(self):
         config = default_rail_configs()["NASDAQ"]
@@ -83,10 +96,16 @@ class RailEdgeStrategyTests(unittest.TestCase):
         )
 
         close_orders = [order for order in orders if order["order_type"] == "ioc"]
+        limit_asks = [
+            order
+            for order in orders
+            if order["side"] == "ask" and order["order_type"] == "limit"
+        ]
         self.assertEqual(len(close_orders), 1)
         self.assertEqual(close_orders[0]["side"], "ask")
         self.assertEqual(close_orders[0]["price"], 10100)
         self.assertEqual(close_orders[0]["quantity"], 350)
+        self.assertEqual(sum(order["quantity"] for order in limit_asks), 270)
 
     def test_short_position_closes_only_against_visible_asks_below_threshold(self):
         config = default_rail_configs()["NASDAQ"]
@@ -109,9 +128,9 @@ class RailEdgeStrategyTests(unittest.TestCase):
         self.assertEqual(close_orders[0]["price"], 10050)
         self.assertEqual(close_orders[0]["quantity"], 65)
 
-    def test_cash_and_pending_bids_limit_new_rail_bid_quantity(self):
+    def test_cash_and_pending_bids_limit_new_rail_bid_quantity_to_positive_available_cash(self):
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ", cash=-4_000_000)
+        state = ExchangeState(exchange="NASDAQ", cash=10_000_000)
         state.track_order(
             local_id="old-bid",
             order_id=7,
@@ -127,7 +146,17 @@ class RailEdgeStrategyTests(unittest.TestCase):
         bids = [order for order in orders if order["side"] == "bid"]
 
         self.assertEqual(len(bids), 1)
-        self.assertLessEqual((100 + bids[0]["quantity"]) * 7001, 1_000_000)
+        self.assertLessEqual((100 + bids[0]["quantity"]) * 7001, 10_000_000)
+
+    def test_negative_cash_does_not_place_more_rail_bids(self):
+        config = default_rail_configs()["NASDAQ"]
+        state = ExchangeState(exchange="NASDAQ", cash=-1)
+        strategy = RailEdgeStrategy(config)
+
+        orders = strategy.plan_orders(state, depth=None, now_ms=4_500)
+        bids = [order for order in orders if order["side"] == "bid"]
+
+        self.assertEqual(bids, [])
 
     def test_inflight_rail_orders_count_as_reserved_capacity(self):
         config = default_rail_configs()["NASDAQ"]

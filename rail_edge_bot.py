@@ -251,8 +251,11 @@ class RailEdgeStrategy:
         orders: list[dict[str, Any]] = []
 
         close_order = self._plan_close_order(state, depth)
+        ask_reserved_this_tick = 0
         if close_order is not None:
             orders.append(close_order)
+            if close_order["side"] == "ask":
+                ask_reserved_this_tick = int(close_order["quantity"])
 
         bid_qty = self._rail_bid_quantity(state)
         if bid_qty > 0:
@@ -267,7 +270,7 @@ class RailEdgeStrategy:
                 )
             )
 
-        ask_qty = self._rail_ask_quantity(state)
+        ask_qty = self._rail_ask_quantity(state, ask_reserved_this_tick)
         if ask_qty > 0:
             orders.append(
                 self._order(
@@ -324,17 +327,15 @@ class RailEdgeStrategy:
         pending_qty = state.pending_qty(
             instrument, side="bid", price=self.config.low_bid_price, role="rail"
         )
-        cash_room = state.cash - CASH_FLOOR - state.pending_bid_value()
+        cash_room = state.cash - state.pending_bid_value()
         cash_qty = max(0, cash_room // self.config.low_bid_price)
         return max(0, min(position_room - pending_qty, cash_qty))
 
-    def _rail_ask_quantity(self, state: ExchangeState) -> int:
+    def _rail_ask_quantity(self, state: ExchangeState, extra_reserved: int = 0) -> int:
         instrument = self.config.instrument
-        short_room = state.position(instrument) - MAX_SHORT
-        pending_qty = state.pending_qty(
-            instrument, side="ask", price=self.config.high_ask_price, role="rail"
-        )
-        return max(0, short_room - pending_qty)
+        owned_qty = max(0, state.position(instrument))
+        pending_qty = state.pending_qty(instrument, side="ask") + int(extra_reserved)
+        return max(0, owned_qty - pending_qty)
 
     @staticmethod
     def _order(
