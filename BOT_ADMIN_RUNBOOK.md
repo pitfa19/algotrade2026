@@ -110,7 +110,7 @@ Scores are operator scores from 1-10, not guaranteed PnL.
 | `analyzerbot.py` | No | Offline analysis and scoring | 10 | N/A | 2 | 9 | 9 | Run after captures |
 | `dashboard.py` | No | Monitoring UI | 8 | N/A | 4 | 7 | 7 | Useful if connection budget permits |
 | `demo_bot.cpp` | Demo | C++ reference framework | 6 | 2 | 6 | 5 | 4 | Reference only |
-| `bot.cpp` | Broken/unsafe C++ trader | NYSE-mid comparison attempt | 2 | 1 | 7 | 1 | 1 | Do not run live until fixed |
+| `bot.cpp` | Patched C++ trader | NYSE fair-value cross-venue IOC | 4 | 4 | 7 | 3 | 4 | Experimental only, CMake build checked |
 | `bot.py` | No | C++ text in `.py` file | 1 | 0 | 1 | 0 | 0 | Do not run with Python |
 
 ## 5. Individual Bot Runbook
@@ -613,36 +613,47 @@ Admin score: 4/10. Keep as a C++ template.
 ### `bot.cpp`
 
 Purpose: modified C++ bot that tries to trade cross-venue price differences
-against NYSE mid-price. It is not live-ready.
+against NYSE mid-price. It has been patched for the obvious API and symbol
+mapping bugs, but it is still not a first-choice live bot.
 
 What it tries to do:
 
 1. Connect one thread per exchange.
 2. Keep a shared order book snapshot.
-3. For each instrument seen on the current exchange, find the same instrument
-   on NYSE.
-4. If NYSE mid-price is higher than the current exchange mid-price, buy on the
-   current exchange.
-5. If NYSE mid-price is lower, sell on the current exchange.
+3. Normalize instruments to base symbols, such as `CARD`, so `NYSE-CARD` can
+   be compared with `NASDAQ-CARD`.
+4. Use NYSE mid-price as the reference fair value.
+5. If current venue ask is at least 5 cents below NYSE mid, IOC-buy with side
+   `bid`.
+6. If current venue bid is at least 5 cents above NYSE mid, IOC-sell with side
+   `ask`.
+7. Cap each update to two submitted orders.
 
-Critical problems:
+Debug status:
 
-| Problem | Impact |
+| Item | Status |
 |---|---|
-| Uses `"buy"` and `"sell"` as order sides | The exchange API expects `"bid"` and `"ask"`, so orders are likely rejected |
-| Compares exact instrument IDs across venues | `NYSE-CARD` and `NASDAQ-CARD` do not match as strings, so cross-venue logic misses most intended pairs |
-| Threshold is `0.05` cents | Prices are integer cents, so this is effectively zero and would overtrade if the symbol bug is fixed |
-| No rate limiter | Could exceed message budget after the strategy is corrected |
-| No inventory or cash guard | Can accumulate position without local risk control |
-| No pending-order cap management | Resting orders can pile up until expiry or exchange rejection |
-| No IOC flag | Orders are regular expiring limits, not clean arbitrage takers |
-| Ends whole process on first `end_of_round` | Not useful for multi-segment operation without wrapper/restart logic |
-| Fill callback lacks instrument/side/price | Makes strategy-level PnL and risk response weak |
-| Not built by existing CMake | `cmake --build build` only produces `demo_bot` |
+| API order sides | Fixed to use `bid` and `ask` |
+| Cross-venue instrument matching | Fixed to compare base symbols |
+| Threshold | Fixed from `0.05` cents to `5` cents |
+| IOC orders | Fixed by sending `order_type: ioc` |
+| Build target | Fixed by adding CMake target `bot_cpp` |
+| CMake build | Verified locally with target `bot_cpp` |
+| Inventory/cash guard | Still missing |
+| Global message throttle | Still weak; only per-update order cap exists |
+| Fill detail tracking | Still incomplete |
+| Multi-segment operation | Still exits on first `end_of_round` |
 
-Do not run live as-is.
+Do not run broad live as-is. If testing it, use one or two venues first.
 
 If an admin needs to compile it for inspection:
+
+```bash
+cmake -S . -B build
+cmake --build build --target bot_cpp
+```
+
+Direct compile alternative, if local include and link paths are already set:
 
 ```bash
 g++ -std=c++20 -O2 -o bot_cpp bot.cpp -lpthread
@@ -662,19 +673,15 @@ EXCHANGES=NYSE,NASDAQ ./bot_cpp
 
 Required fixes before live:
 
-1. Normalize symbols to base symbols such as `CARD`, then map them back to
-   exchange-specific instrument IDs before sending orders.
-2. Replace order sides with `bid` and `ask`.
-3. Use cents-based thresholds that cover spread, fees/slippage assumptions, and
-   stale-book risk.
-4. Add a local message-rate limiter.
-5. Add inventory, cash, and per-symbol position limits.
-6. Use IOC orders for arbitrage unless intentionally making passive quotes.
-7. Track order IDs, pending orders, fills, and per-exchange reject counts.
-8. Reconnect or restart cleanly between round segments.
+1. Repeat the CMake build on the team VM before the round.
+2. Add inventory, cash, and per-symbol position limits.
+3. Add a true global message-rate limiter.
+4. Track order IDs, pending orders, fills, and per-exchange reject counts.
+5. Reconnect or restart cleanly between round segments.
+6. Paper-run on `EXCHANGES=NYSE,NASDAQ` before adding more venues.
 
-Admin score: 1/10. Interesting C++ experiment, but lower priority than fixing
-and testing the Python bots.
+Admin score: 4/10. More usable after debugging, but still lower priority than
+the tested Python bots.
 
 ### `bot.py`
 
@@ -699,7 +706,7 @@ Use this during a round:
 | You want maximum ambition and accept risk | `prism.py --venues ...` |
 | You are in a testing round | `history_bot.py` + `analyzerbot.py` |
 | Official dashboard is poor | `dashboard.py` |
-| You need a C++ starting point | `demo_bot.cpp`; avoid `bot.cpp` live |
+| You need a C++ starting point | `demo_bot.cpp`; use `bot.cpp` only after a small-venue build check |
 
 ## 7. Admin Scoring Method
 

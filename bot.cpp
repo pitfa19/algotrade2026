@@ -97,6 +97,12 @@ static std::optional<std::string> lookup_host(const std::string& name) {
     return std::nullopt;
 }
 
+static std::string base_symbol(const std::string& instrument_id) {
+    auto dash = instrument_id.find('-');
+    if (dash == std::string::npos) return instrument_id;
+    return instrument_id.substr(dash + 1);
+}
+
 struct Config {
     std::string exchanges_str;       // comma-separated exchange names
     int         reconnect_max = 10;
@@ -365,9 +371,6 @@ public:
  *
  * This does NOT trade. Replace with your own logic.
  */
-#include <unordered_set>
-
-
 static int64_t now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(
@@ -460,7 +463,8 @@ public:
     // â”€â”€ Order helpers â”€â”€
 
     bool place_order(const std::string& instrument_id, const std::string& side,
-                     int price, int quantity, int expiry_ms = 0) {
+                     int price, int quantity, int expiry_ms = 0,
+                     const std::string& order_type = "ioc") {
         if (expiry_ms <= 0) expiry_ms = config_.default_expiry_ms;
         json msg = {
             {"type",            "add_order"},
@@ -469,7 +473,8 @@ public:
             {"price",           price},
             {"expiry",          now_ms() + expiry_ms},
             {"side",            side},
-            {"quantity",        quantity}
+            {"quantity",        quantity},
+            {"order_type",      order_type}
         };
         return send(msg);
     }
@@ -530,10 +535,12 @@ public:
 
     bool place_order(const std::string& exchange, const std::string& instrument_id,
                      const std::string& side, int price, int quantity,
-                     int expiry_ms = 0) {
+                     int expiry_ms = 0,
+                     const std::string& order_type = "ioc") {
         auto* conn = connection(exchange);
         if (!conn) return false;
-        return conn->place_order(instrument_id, side, price, quantity, expiry_ms);
+        return conn->place_order(instrument_id, side, price, quantity, expiry_ms,
+                                 order_type);
     }
 
     bool cancel_order(const std::string& exchange, int64_t order_id,
@@ -730,6 +737,8 @@ public:
     void on_market_data(Bot& bot,
                         const std::string& exchange,
                         const MarketState& state) override {
+        if (exchange == "NYSE")
+            return;
 
         auto nyse_instruments = state.instruments_on("NYSE");
         auto exec_instruments = state.instruments_on(exchange);
@@ -737,17 +746,23 @@ public:
         if (nyse_instruments.empty() || exec_instruments.empty())
             return;
 
-        std::unordered_set<std::string> nyse_set(
-            nyse_instruments.begin(),
-            nyse_instruments.end()
-        );
+        std::map<std::string, std::string> nyse_by_base;
+        for (const auto& nyse_id : nyse_instruments)
+            nyse_by_base[base_symbol(nyse_id)] = nyse_id;
 
-        for (const auto& symbol : exec_instruments) {
-            if (!nyse_set.count(symbol))
+        constexpr int edge_threshold_cents = 5;
+        constexpr int order_quantity = 10;
+        constexpr int order_expiry_ms = 1000;
+        constexpr int max_orders_per_update = 2;
+
+        int orders_sent = 0;
+        for (const auto& exec_id : exec_instruments) {
+            auto nyse_it = nyse_by_base.find(base_symbol(exec_id));
+            if (nyse_it == nyse_by_base.end())
                 continue;
 
-            auto nyse = state.get_book("NYSE", symbol);
-            auto exec_book = state.get_book(exchange, symbol);
+            auto nyse = state.get_book("NYSE", nyse_it->second);
+            auto exec_book = state.get_book(exchange, exec_id);
 
             if (!nyse || !exec_book)
                 continue;
@@ -761,16 +776,23 @@ public:
                 continue;
 
             double nyse_mid = (*n_bid + *n_ask) * 0.5;
-            double exec_mid = (*e_bid + *e_ask) * 0.5;
-            double diff = nyse_mid - exec_mid;
+            double buy_edge = nyse_mid - *e_ask;
+            double sell_edge = *e_bid - nyse_mid;
 
-            const double threshold = 0.05;
-
-            if (diff > threshold) {
-                bot.place_order(exchange, symbol, "buy", *e_ask, 100);
+            if (buy_edge >= edge_threshold_cents) {
+                if (bot.place_order(exchange, exec_id, "bid", *e_ask,
+                                    order_quantity, order_expiry_ms, "ioc")) {
+                    ++orders_sent;
+                }
+            } else if (sell_edge >= edge_threshold_cents) {
+                if (bot.place_order(exchange, exec_id, "ask", *e_bid,
+                                    order_quantity, order_expiry_ms, "ioc")) {
+                    ++orders_sent;
+                }
             }
-            if (diff < -threshold) {
-                bot.place_order(exchange, symbol, "sell", *e_bid, 100);
+
+            if (orders_sent >= max_orders_per_update) {
+                break;
             }
         }
     }
