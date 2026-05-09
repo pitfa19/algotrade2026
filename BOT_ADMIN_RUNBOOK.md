@@ -21,7 +21,7 @@ Prepare Python:
 cd ~/algotrade2026
 python3 -m venv .venv
 source .venv/bin/activate
-pip install websockets aiohttp
+pip install -r requirements.txt
 ```
 
 Run every long-lived process inside `tmux`:
@@ -60,23 +60,32 @@ Avoid running these together:
 - `fabijan_v1.py` and `fabijan_v3.py`: both consume ZSE basket-arb risk.
 - `fabijan_v2.py` and `fabijan_v3.py`: both consume cross-venue ETF risk.
 - `edge_trader_bot.py` and `codex_bot.py`: both can trade broad multi-venue arb.
+- `edge_trader_bot.py` and `novel_edge_bot.py`: both fire ETF dislocations,
+  cross-venue pairs, and single-leg fair-value takes.
 - `codex_bot.py` and `codex_bot_v2.py`: same family, same edges, will fight.
 - `namikv1.py` and `namikv2.py`: same family, same edges, will fight.
 - `prism.py` and any other active trading bot: `prism.py` is broad and aggressive.
 - `prism.py` and `cascade.py`: identical strategy surface, will fight each other.
 - `cascade.py` and any other active trading bot: same edge surface as prism, broader fills.
-- `parallax.py` and any other active trading bot: `parallax.py` is the broadest in the repo.
+- `parallax.py` and any other active trading bot: `parallax.py` is a broad
+  consensus-FV bot and should run alone.
 - `parallax.py` and `prism.py`: maximum overlap; both fire ETF/basket/sub-ETF/xv arbs.
 - `parallax.py` and `apex_bot.py`: both fire ETF basket arb and cross-venue arb.
 - `parallax.py` and `god_bot.py`: same edge surface (ETF/basket, cross-venue, safe-haven).
+- `prism_v2.py` and any other active trading bot: it combines prism/cascade
+  execution with parallax-style FV/stat/sector/MM edges. Run it alone.
+- `prism_v2.py` and `parallax.py`: nearly identical broad alpha surface, with
+  different ETF depth execution. They will duplicate orders.
 - `god_bot.py` and any other active trading bot: `god_bot.py` spans ETF basket
   arb, cross-venue lead/lag, CARD/SIMP anomaly detection, safe-haven rotation,
   and end-of-segment flattening. Run it alone unless you are deliberately
   partitioning exchanges and risk budgets.
 - `apex_bot.py` and any of `fabijan_v1/v2/v3.py`, `edge_trader_bot.py`, `codex_bot.py`,
-  `codex_bot_v2.py`, `namikv1.py`, `alpha_bot.py`, `prism.py`: `apex_bot.py` covers
-  ETF basket arb, cross-venue arb, MM-skew, and EOS unwind — running it next to
-  another arb bot duplicates orders against the same edges and shares cash/positions.
+  `codex_bot_v2.py`, `namikv1.py`, `namikv2.py`, `alpha_bot.py`, `novel_edge_bot.py`,
+  `prism.py`, `cascade.py`, `parallax.py`, `prism_v2.py`, or `god_bot.py`:
+  `apex_bot.py` covers ETF basket arb, cross-venue arb, MM-skew, and EOS
+  unwind — running it next to another arb bot duplicates orders against the
+  same edges and shares cash/positions.
 
 Safe combinations:
 
@@ -100,6 +109,13 @@ tmux new -s edge
 LIVE_TRADING=1 EXCHANGES=HKEX,NASDAQ,ZSE,NYSE,SSE,JPX,NSE EDGE_QTY=5 MAX_MSGS_PER_SEC=250 python3 edge_trader_bot.py
 ```
 
+For a tested dry-run-gated broad IOC bot, use:
+
+```bash
+tmux new -s novel
+LIVE_TRADING=1 EXCHANGES=ZSE,NYSE,NASDAQ,HKEX,TMX MAX_MSGS_PER_SEC=250 SINGLE_QTY=5 PAIR_QTY=5 BASKET_UNITS=2 python3 novel_edge_bot.py
+```
+
 For the new dry-run-gated multi-strategy bot, use:
 
 ```bash
@@ -107,7 +123,7 @@ tmux new -s god
 LIVE_TRADING=1 GOD_LOCATION=ZSE GOD_VENUES=ZSE,NYSE,NASDAQ,EURONEXT,LSE,HKEX,TMX GOD_MAX_MSGS_PER_SEC=120 GOD_MAX_ORDER_QTY=8 GOD_MAX_SYMBOL_ABS_POS=80 GOD_ARB_UNIT_SIZE=1 GOD_ORDERS_PER_EVAL=16 GOD_ENABLE_PASSIVE_MICRO=0 python3 god_bot.py
 ```
 
-For maximum alpha but highest operational risk, use:
+For the classic Prism-family all-market bot, use:
 
 ```bash
 tmux new -s prism
@@ -123,6 +139,14 @@ tmux new -s parallax
 LOGLEVEL=INFO python3 parallax.py --venues ZSE,NYSE,TMX
 ```
 
+For maximum current ambition after a subset smoke test, run `prism_v2.py`
+alone on all 10 venues:
+
+```bash
+tmux new -s prismv2
+LOGLEVEL=INFO python3 -u prism_v2.py --venues NYSE,NASDAQ,SSE,JPX,EURONEXT,LSE,HKEX,NSE,TMX,ZSE
+```
+
 ## 4. Bot Scores
 
 Scores are operator scores from 1-10, not guaranteed PnL.
@@ -133,6 +157,7 @@ Scores are operator scores from 1-10, not guaranteed PnL.
 | `fabijan_v2.py` | Yes | Low-latency same-ETF cross-venue arb | 8 | 6 | 4 | 8 | 7 | Good second bot, do not pair with v1 on same risk unless careful |
 | `fabijan_v3.py` | Yes | v1 + v2 combined | 7 | 8 | 5 | 8 | 8 | Best Fabijan variant if stable |
 | `edge_trader_bot.py` | Yes | Analyzer-discovered ETF/routes/CARD | 7 | 8 | 5 | 7 | 8 | Best data-driven bot |
+| `novel_edge_bot.py` | Yes | ZSE basket arb + cross-venue pairs + single-leg FV dislocations | 7 | 8 | 6 | 8 | 8 | Clean dry-run-gated broad IOC bot; good controlled competitor to edge/god |
 | `codex_bot.py` | Yes | Broad microprice, latency, sector, ETF lead-lag | 5 | 8 | 8 | 6 | 7 | Experimental broad bot |
 | `codex_bot_v2.py` | Yes | Newer broad Codex variant | 5 | 8 | 8 | 6 | 7 | Experimental, compare to `codex_bot.py` |
 | `namikv1.py` | Yes | Full multi-strategy with hedge/adaptive features | 5 | 8 | 9 | 6 | 7 | Advanced experimental |
@@ -140,7 +165,8 @@ Scores are operator scores from 1-10, not guaranteed PnL.
 | `alpha_bot.py` | Yes | MM-skew, non-50 size, CARD/SIMP, adaptive thresholds | 5 | 8 | 9 | 6 | 7 | Advanced experimental |
 | `prism.py` | Yes | Multi-venue ETF/basket/sub-ETF/stock arb + passive MM | 4 | 9 | 10 | 6 | 7 | Highest ambition, highest blast radius |
 | `cascade.py` | Yes | prism + depth-walked ETF basket arb, plan ranking, faster reconnect | 4 | 9 | 10 | 6 | 8 | Surgical superset of prism — verified 3× ETF arb size on stacked-edge books |
-| `parallax.py` | Yes | prism edges + consensus FV, vol-adaptive thresholds, stat FV snipe, sector residual ETF-hedged, SH coherence, inv+flow-skewed MM | 4 | 10 | 10 | 5 | 8 | Broadest bot in the repo; highest expected edge but highest blast radius |
+| `parallax.py` | Yes | prism edges + consensus FV, vol-adaptive thresholds, stat FV snipe, sector residual ETF-hedged, SH coherence, inv+flow-skewed MM | 4 | 10 | 10 | 5 | 8 | Broad consensus-FV bot; high expected edge and high blast radius |
+| `prism_v2.py` | Yes | parallax-style broad alpha + true depth-walked ETF basket sizing | 4 | 10 | 10 | 6 | 8 | Current most ambitious Prism-family bot; run alone after subset smoke test |
 | `apex_bot.py` | Yes | Rule-based ETF basket arb + ZSE oracle cross-venue + MM-skew + EOS unwind | 7 | 8 | 6 | 7 | 8 | New flagship, deterministic ETF edge, untested live |
 | `god_bot.py` | Yes | Dry-run-gated ETF/basket, lead-lag, anomaly, safe-haven, flattening | 8 | 8 | 7 | 7 | 8 | New safest broad bot; first live with conservative caps |
 | `history_bot.py` | No | Data capture | 10 | N/A | 2 | 9 | 9 | Always useful in tests |
@@ -148,7 +174,6 @@ Scores are operator scores from 1-10, not guaranteed PnL.
 | `dashboard.py` | No | Monitoring UI | 8 | N/A | 4 | 7 | 7 | Useful if connection budget permits |
 | `demo_bot.cpp` | Demo | C++ reference framework | 6 | 2 | 6 | 5 | 4 | Reference only |
 | `bot.cpp` | Patched C++ trader | NYSE fair-value cross-venue IOC | 4 | 4 | 7 | 3 | 4 | Experimental only, CMake build checked |
-| `bot.py` | No | C++ text in `.py` file | 1 | 0 | 1 | 0 | 0 | Do not run with Python |
 
 ## 5. Individual Bot Runbook
 
@@ -275,6 +300,90 @@ Flags:
 | `MAX_SHORT` | `-80` | Soft short cap per instrument/exchange |
 
 Admin score: 8/10. Best data-driven live trader.
+
+### `novel_edge_bot.py`
+
+Purpose: self-contained broad IOC bot with a cleaner risk gate than the older
+experimental broad bots. It trades three edge classes:
+
+- ZSE ETF basket arbitrage with integer hedge ratios.
+- Same-ticker cross-venue IOC pairs.
+- Single-leg fair-value dislocations, with small lead-lag adjustment.
+
+Dry run:
+
+```bash
+python3 novel_edge_bot.py
+```
+
+Conservative live run:
+
+```bash
+tmux new -s novel
+LIVE_TRADING=1 \
+EXCHANGES=ZSE,NYSE,NASDAQ,HKEX,TMX \
+MAX_MSGS_PER_SEC=250 \
+SINGLE_EDGE_CENTS=45 \
+PAIR_EDGE_CENTS=85 \
+BASKET_EDGE_CENTS=28 \
+SINGLE_QTY=5 \
+PAIR_QTY=5 \
+BASKET_UNITS=2 \
+MAX_GROUPS_PER_TICK=2 \
+python3 novel_edge_bot.py
+```
+
+Aggressive live run:
+
+```bash
+tmux new -s novel-aggr
+LIVE_TRADING=1 \
+EXCHANGES=NYSE,NASDAQ,SSE,JPX,Euronext,LSE,HKEX,NSE,TMX,ZSE \
+MAX_MSGS_PER_SEC=350 \
+SINGLE_EDGE_CENTS=35 \
+PAIR_EDGE_CENTS=70 \
+BASKET_EDGE_CENTS=22 \
+SINGLE_QTY=8 \
+PAIR_QTY=6 \
+BASKET_UNITS=3 \
+MAX_GROUPS_PER_TICK=3 \
+python3 novel_edge_bot.py
+```
+
+Flags:
+
+| Env | Default | Meaning |
+|---|---:|---|
+| `LIVE_TRADING` | false | `1` sends real orders |
+| `EXCHANGES` | all 10 | Comma-separated exchange subset |
+| `MAX_MSGS_PER_SEC` | `350` | Per-exchange local send cap |
+| `MAX_BOOK_AGE_SECONDS` | `1.25` | Freshness window for fair value inputs |
+| `SINGLE_EDGE_CENTS` | `35` | Single-leg FV dislocation threshold |
+| `PAIR_EDGE_CENTS` | `70` | Cross-venue pair threshold |
+| `BASKET_EDGE_CENTS` | `22` | ZSE ETF basket threshold |
+| `SINGLE_QTY` | `8` | Single-leg order size |
+| `PAIR_QTY` | `6` | Cross-venue pair size |
+| `BASKET_UNITS` | `3` | Basket multiples per ETF arb |
+| `MAX_GROUPS_PER_TICK` | `3` | Max opportunity groups per tick |
+| `MAX_LONG` | `350` | Soft long cap per instrument |
+| `MAX_SHORT` | `-120` | Soft short cap per instrument |
+| `MIN_CASH_CENTS` | `-2500000` | Soft per-exchange cash floor |
+| `NO_NEW_RISK_AFTER_MS` | `575000` | Stop opening near segment end |
+| `GROUP_COOLDOWN_SECONDS` | `0.35` | Duplicate opportunity cooldown |
+| `LOG_LEVEL` | `INFO` | Logging verbosity |
+
+Operator notes:
+
+- This is a good middle path between `edge_trader_bot.py` and `god_bot.py`:
+  dry-run-gated, unit-tested, but still broad enough to find cross-venue and
+  FV dislocation edges.
+- It does not currently implement a dedicated end-of-segment flatten strategy;
+  it blocks new risk near segment end. Watch residual inventory.
+- Do not run with `edge_trader_bot.py`, `codex_bot*.py`, `namikv*.py`,
+  `alpha_bot.py`, `apex_bot.py`, `prism.py`, `cascade.py`, `parallax.py`,
+  `prism_v2.py`, or `god_bot.py`.
+
+Admin score: 8/10. Good controlled broad bot for live comparison.
 
 ### `fabijan_v1.py`
 
@@ -695,7 +804,7 @@ cascade is the strict superset.
 
 ### `parallax.py`
 
-Purpose: broadest strategy bot in the repo. Treats every quote as a
+Purpose: broad consensus-FV strategy bot. Treats every quote as a
 latency-delayed observation of one fair value and triangulates a consensus
 FV per ticker. Trades stale quotes wherever they appear.
 
@@ -777,7 +886,7 @@ vol spike it rises to roughly `3.8c`, still under prism's flat `4c`.
 
 Tuning notes:
 
-- If the bot trips the rate-limit close, raise `MAX_PLANS_PER_TICK`,
+- If the bot trips the rate-limit close, lower `MAX_PLANS_PER_TICK`, raise
   `MM_REFRESH_S`, and consider trimming `MM_INSTRUMENTS`.
 - If positions hit soft caps too often, raise `MIN_ARB_EDGE` to 3 and
   drop `STAT_MAX_INVENTORY` back toward 100.
@@ -788,6 +897,106 @@ Tuning notes:
 Admin score: 8/10 overall, 4/10 safety. Highest expected edge in the repo
 on paper, but the broadest blast radius. Run on a small venue subset before
 expanding.
+
+### `prism_v2.py`
+
+Purpose: current most ambitious Prism-family bot. It keeps the deterministic
+multi-venue arb core from `prism.py`, adds `cascade.py`-style true top-5
+depth-walked ETF basket execution, and layers in `parallax.py`-style
+consensus fair value, statistical snipes, sector residual hedges, safe-haven
+coherence, and inventory/flow-skewed passive market making.
+
+Strategies (priority order):
+
+- Depth-walked ETF versus basket arbitrage, multi-venue routed.
+- Sub-ETF identity arbitrage (`6·ETFA = 3·ETFA3 + complement`, same for B).
+- Cross-venue same-stock arbitrage.
+- Statistical FV snipes from the consensus tape.
+- Sector residual mean-reversion hedged with the matching ETF.
+- Safe-haven coherence fade around `ETFSH`.
+- Inventory- and flow-skewed two-sided market making.
+- Settlement-aware unwind — last 60 s ramp, last 8 s IOC sweep.
+
+Defensive layer:
+
+- Local 400 msg/s/exchange token bucket.
+- Atomic plan validation before dispatch.
+- Optimistic position/cash tracking with periodic `get_inventory` reconcile.
+- Volatility-adaptive edge floors.
+- Aggressor-flow gating and MM skew.
+- Duplicate-plan fire gap and max plans per tick.
+
+There is no `LIVE_TRADING` gate in the file. Treat as live by default.
+
+Subset smoke test:
+
+```bash
+tmux new -s prismv2-test
+LOGLEVEL=INFO python3 -u prism_v2.py --venues ZSE,NYSE,TMX
+```
+
+Full-potential run, all 10 venues:
+
+```bash
+tmux new -s prismv2
+LOGLEVEL=INFO python3 -u prism_v2.py --venues NYSE,NASDAQ,SSE,JPX,EURONEXT,LSE,HKEX,NSE,TMX,ZSE
+```
+
+Flags:
+
+| Flag/Env | Default | Meaning |
+|---|---:|---|
+| `--venues` | all 10 | Comma-separated venue subset |
+| `LOGLEVEL` | `INFO` | Logging verbosity |
+
+Important constants in file:
+
+```text
+RATE_PER_S=400
+SOFT_POS_MAX=1800
+SOFT_POS_MIN=-180
+MIN_ARB_EDGE=2
+SUB_ETF_EDGE=4
+EDGE_VOL_K=0.6
+STAT_EDGE_SIGMA=1.8
+STAT_MAX_QTY=35
+STAT_MAX_INVENTORY=250
+SECTOR_Z_THRESHOLD=1.5
+SECTOR_MAX_QTY=25
+SH_GUARD_THRESHOLD=25
+SH_GUARD_MAX_QTY=12
+ARB_MAX_K=45
+XV_MAX_QTY=60
+MM_QTY_BASE=10
+MM_QTY_MAX=24
+MM_REFRESH_S=0.8
+MAX_PLANS_PER_TICK=30
+PLAN_FIRE_GAP_S=0.04
+EOS_UNWIND_MS=60000
+EOS_FLATTEN_MS=8000
+```
+
+Pre-flight:
+
+```bash
+python3 -m py_compile prism_v2.py
+python3 -m unittest tests.test_prism_v2 -v
+```
+
+Operator notes:
+
+- Run alone. It overlaps with almost every profitable broad edge in the repo.
+- Use `LOGLEVEL=INFO`; `DEBUG` can slow the bot and flood the terminal.
+- If the server closes connections with `Message rate limit exceeded`, lower
+  `RATE_PER_S` toward `300-350` or reduce `MAX_PLANS_PER_TICK`.
+- If inventory sits near soft caps, raise `MIN_ARB_EDGE` to 3, reduce
+  `STAT_MAX_INVENTORY`, or test on fewer venues first.
+- Compared with `parallax.py`, this is the stronger Prism-family candidate
+  when stacked-depth ETF dislocations appear. Compared with `god_bot.py`, it
+  is much more aggressive and has no live/dry gate.
+
+Admin score: 8/10 overall, 4/10 safety. Highest current ambition; smoke-test
+on a subset before the all-venue run.
 
 ### `apex_bot.py`
 
@@ -882,9 +1091,10 @@ Operator notes:
 
 - The bot is **always live** — there is no `LIVE_TRADING` gate. Use
   `APEX_DRY_RUN=1` for observe-only.
-- Skip co-locating with `prism.py`, `fabijan_v*.py`, `edge_trader_bot.py`,
-  `codex_bot*.py`, `namikv1.py`, or `alpha_bot.py`. They contend for the
-  same edges and the team account is shared by source IP.
+- Skip co-locating with `prism.py`, `cascade.py`, `parallax.py`, `prism_v2.py`,
+  `fabijan_v*.py`, `edge_trader_bot.py`, `novel_edge_bot.py`, `codex_bot*.py`,
+  `namikv*.py`, `alpha_bot.py`, or `god_bot.py`. They contend for the same
+  edges and the team account is shared by source IP.
 - Pairs cleanly with `history_bot.py` and `dashboard.py` (read-only).
 - Logs at INFO are quiet by design — only connect/disconnect/co-location
   events. Use `APEX_LOG=DEBUG` to see strategy-level decisions.
@@ -1126,16 +1336,6 @@ Required fixes before live:
 Admin score: 4/10. More usable after debugging, but still lower priority than
 the tested Python bots.
 
-### `bot.py`
-
-This file currently contains C++ text despite the `.py` extension. Do not run:
-
-```bash
-python3 bot.py
-```
-
-Admin score: 0/10.
-
 ## 6. Live Decision Matrix
 
 Use this during a round:
@@ -1145,10 +1345,12 @@ Use this during a round:
 | First live attempt, want stability | `fabijan_v1.py` |
 | ETF locks across Euronext/ZSE/LSE/TMX are visible | `fabijan_v2.py` or `fabijan_v3.py` |
 | Analyzer shows repeated routes like `INA HKEX -> NASDAQ` | `edge_trader_bot.py` |
+| You want a dry-run-gated broad IOC bot | `novel_edge_bot.py` conservative command |
 | You want broad alpha and can monitor closely | `codex_bot.py`, `codex_bot_v2.py`, `namikv1.py`, `namikv2.py`, or `alpha_bot.py` |
 | You want maximum ambition and accept risk | `prism.py --venues ...` |
 | You like prism but want bigger fills on the same edges | `cascade.py --venues ...` |
 | You want broader-than-prism alpha with consensus FV, stat snipes, and inventory-skewed MM | `parallax.py --venues ...` |
+| You want the current most ambitious Prism-family bot | `prism_v2.py --venues ...` after subset smoke test |
 | You want the deterministic ETF edge with auto co-location | `apex_bot.py` (dry-run first) |
 | You want the new broad bot with dry-run gate and strict risk checks | `god_bot.py` conservative command |
 | You are in a testing round | `history_bot.py` + `analyzerbot.py` |
@@ -1183,11 +1385,23 @@ Manual score sheet:
 | `fabijan_v2.py` |  |  |  |  |  |  |  |
 | `fabijan_v3.py` |  |  |  |  |  |  |  |
 | `edge_trader_bot.py` |  |  |  |  |  |  |  |
+| `novel_edge_bot.py` |  |  |  |  |  |  |  |
 | `codex_bot.py` |  |  |  |  |  |  |  |
+| `codex_bot_v2.py` |  |  |  |  |  |  |  |
+| `namikv1.py` |  |  |  |  |  |  |  |
+| `namikv2.py` |  |  |  |  |  |  |  |
 | `alpha_bot.py` |  |  |  |  |  |  |  |
 | `prism.py` |  |  |  |  |  |  |  |
+| `cascade.py` |  |  |  |  |  |  |  |
+| `parallax.py` |  |  |  |  |  |  |  |
+| `prism_v2.py` |  |  |  |  |  |  |  |
 | `apex_bot.py` |  |  |  |  |  |  |  |
 | `god_bot.py` |  |  |  |  |  |  |  |
+| `history_bot.py` |  |  |  |  |  |  |  |
+| `analyzerbot.py` |  |  |  |  |  |  |  |
+| `dashboard.py` |  |  |  |  |  |  |  |
+| `demo_bot.cpp` |  |  |  |  |  |  |  |
+| `bot.cpp` |  |  |  |  |  |  |  |
 
 ## 8. Shutdown
 
@@ -1224,7 +1438,11 @@ The safest profitable path is:
 history_bot.py -> analyzerbot.py -> fabijan_v1.py, edge_trader_bot.py, or god_bot.py
 ```
 
-Use broad bots only after they show clean dry-run output and stable behavior in
-a testing segment. If two bots disagree on the same instrument, stop one. The
-account is shared by source IP, so every bot shares the same inventory, cash,
-order count, and rate-limit blast radius.
+Use `novel_edge_bot.py` when you want a dry-run-gated broad IOC bot that is
+easier to reason about than the biggest experimental systems. Use `prism_v2.py`
+only when you are deliberately making a high-risk, all-venue scoring attempt.
+
+Use broad bots only after they show clean dry-run or subset output and stable
+behavior in a testing segment. If two bots disagree on the same instrument,
+stop one. The account is shared by source IP, so every bot shares the same
+inventory, cash, order count, and rate-limit blast radius.
