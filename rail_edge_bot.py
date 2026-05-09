@@ -64,13 +64,16 @@ class RailConfig:
     # Hard cap per individual rail ticket. Smaller = capacity can't be blown
     # in a single fill; rail re-posts after each fill via the regular planner.
     lot_size: int = 200
-    # Whether the high rail may short via a *resting* limit ask. Many
-    # matching engines (this one included, per server "Insufficient
-    # inventory" rejections) only accept resting asks against owned shares.
-    # Default off — the symmetric upside catch must come via a crossing
-    # IOC instead, which `_plan_close_order` already does for short
-    # inventory we accumulate from real fills.
+    # Whether the high rail may short via a *resting* limit ask. Off:
+    # this exchange rejects resting asks beyond owned shares.
     allow_short_rail: bool = False
+    # Whether to keep a rail ASK active at all when we're long. Off by
+    # default because the resting ask reserves every share we own and
+    # blocks the close/force_close paths from putting up exit orders
+    # (server rejects with "Insufficient inventory"). The close at
+    # close_bid_min already serves as the exit; the high rail is purely
+    # a tail-spike catcher and rarely fires for real.
+    enable_high_rail: bool = False
     # If we have been holding inventory for longer than this, flatten with a
     # market order. The rail edge was already locked in at the rail-fill price;
     # this just frees capital for the next cycle.
@@ -394,22 +397,22 @@ class RailEdgeStrategy:
     def _plan_force_close(
         self, state: ExchangeState, now_ms: int
     ) -> list[dict[str, Any]]:
-        """If inventory has been held past `force_close_after_ms`, send an
-        aggressive IOC just outside our own rail so we flatten without
-        self-trading and without depending on the book having any
-        particular liquidity.
+        """Unstuck path. Two-step:
 
-        - When long: IOC ask at low_bid_price + 1, qty = pos.
-            ‣ matches every bid ≥ that price (MM, other teams), so it
-              clears whatever real liquidity exists at fair value.
-            ‣ does NOT match our own rail bid at low_bid_price (strictly
-              less), so we cannot self-trade.
-            ‣ if NO bid exists at that price either, the IOC cancels;
-              the timer fires again next tick and we retry.
-        - When short: IOC bid at high_ask_price − 1, qty = −pos. (mirror)
+        1. Cancel the rail order on the side that would BLOCK our unwind.
+           When long, the rail ASK reserves every share we own server-side
+           — `free_qty()` becomes 0 and any new ask is rejected with
+           "Insufficient inventory". Same logic for cash on the short side
+           with the rail BID reserving cash.
+        2. Send an aggressive IOC just outside our own rail so it cannot
+           self-trade with the OTHER rail (still alive) but crosses real
+           MM/opponent liquidity at fair value.
 
-        Rails on both sides stay live, so the very next spike still gets
-        caught — no cooldown.
+        Both messages go on the same WebSocket in send order: the server
+        processes the cancel (freeing the reservation) before the IOC, so
+        the IOC has the inventory/cash it needs.
+
+        No cooldown — the cancelled side re-arms next tick.
         """
         instrument = self.config.instrument
         pos = state.position(instrument)
@@ -418,33 +421,41 @@ class RailEdgeStrategy:
             return []
         last_flat = state.last_flat_ms.get(instrument)
         if last_flat is None:
-            # first non-zero observation — anchor the timer here so the
-            # polite IOC close path gets a chance first.
             state.last_flat_ms[instrument] = int(now_ms)
             return []
         if int(now_ms) - last_flat < int(self.config.force_close_after_ms):
             return []
 
+        actions: list[dict[str, Any]] = []
+        # Cancel only the side that's reserving the resource we need.
+        blocking_side = "ask" if pos > 0 else "bid"
+        for o in list(state.live_orders.values()):
+            if (o.instrument == instrument
+                and o.side == blocking_side
+                and o.role == "rail"):
+                actions.append({
+                    "type": "cancel_order",
+                    "order_id": int(o.order_id),
+                    "instrument_id": instrument,
+                    "role": "force_close_cancel",
+                })
+
         if pos > 0:
-            free = state.free_qty(instrument)
-            qty = max(0, min(free, pos))
-            if qty <= 0:
-                return []
-            return [self._order(
+            # An IOC ask at low_bid_price+1 strictly does NOT cross our
+            # surviving rail BID at low_bid_price; it does cross any real
+            # bid at fair value.
+            actions.append(self._order(
                 instrument=instrument, side="ask",
                 price=int(self.config.low_bid_price) + 1,
-                quantity=qty, order_type="ioc", role="force_close",
-            )]
-        # short side
-        cash_qty = state.free_cash() // max(1, int(self.config.high_ask_price) - 1)
-        qty = max(0, min(-pos, cash_qty))
-        if qty <= 0:
-            return []
-        return [self._order(
-            instrument=instrument, side="bid",
-            price=int(self.config.high_ask_price) - 1,
-            quantity=qty, order_type="ioc", role="force_close",
-        )]
+                quantity=pos, order_type="ioc", role="force_close",
+            ))
+        else:
+            actions.append(self._order(
+                instrument=instrument, side="bid",
+                price=int(self.config.high_ask_price) - 1,
+                quantity=-pos, order_type="ioc", role="force_close",
+            ))
+        return actions
 
     def _plan_close_order(
         self, state: ExchangeState, depth: dict[str, dict[str, int]] | None
@@ -456,10 +467,19 @@ class RailEdgeStrategy:
         pos = state.position(instrument)
 
         if pos > 0:
-            # SELL into ≥ close_bid_min bids. Cap at FREE shares — i.e.
-            # owned minus what's already reserved by other resting/inflight
-            # asks — so we never request to sell more than we own.
-            free = state.free_qty(instrument)
+            # SELL into ≥ close_bid_min bids. The constraint is "shares we
+            # don't already have committed to a *non-rail* ask". The rail
+            # ask is conceptually a reservation for the same inventory we
+            # want to release on a close — when we close we won't need both
+            # — so subtract only NON-RAIL asks. (See _plan_force_close for
+            # the explicit cancel + IOC pattern that handles the actual
+            # server-side reservation.)
+            non_rail_asks = sum(
+                max(0, o.remaining)
+                for o in state.live_orders.values()
+                if o.instrument == instrument and o.side == "ask" and o.role != "rail"
+            ) + state.inflight_ask_qty(instrument)
+            free = max(0, pos - non_rail_asks)
             qty = min(free, pos,
                       visible_qty_at_or_better(depth.get("bids", {}),
                                                self.config.close_bid_min, "bid"))
@@ -471,8 +491,7 @@ class RailEdgeStrategy:
                 )
 
         if pos < 0:
-            # BUY against ≤ close_ask_max asks. The cash needed = qty * limit;
-            # cap by free_cash so we never overshoot the cash floor.
+            # BUY against ≤ close_ask_max asks. cash check.
             need_qty = -pos
             visible = visible_qty_at_or_better(depth.get("asks", {}),
                                                self.config.close_ask_max, "ask")
@@ -510,16 +529,15 @@ class RailEdgeStrategy:
         return max(0, min(target_room, position_room, cash_qty))
 
     def _rail_ask_quantity(self, state: ExchangeState, extra_reserved_qty: int = 0) -> int:
-        """Exact ask sizing: only sell shares we *actually own and aren't
-        already trying to sell*. `state.free_qty()` is position −
-        server-reserved-by-resting-asks − inflight-asks."""
+        """High-rail ASK sizing. Disabled by default — see
+        `enable_high_rail` in RailConfig for why."""
+        if not self.config.enable_high_rail:
+            return 0
         instrument = self.config.instrument
         pending_qty = state.pending_qty(instrument, side="ask", role="rail")
         target_room = max(0, int(self.config.lot_size) - pending_qty)
         free = state.free_qty(instrument) - int(extra_reserved_qty)
         if self.config.allow_short_rail:
-            # If shorting via resting asks is permitted on this venue,
-            # extend capacity down to MAX_SHORT.
             free = max(free, state.position(instrument) - MAX_SHORT
                        - state.reserved_for(instrument)
                        - state.inflight_ask_qty(instrument)
@@ -764,8 +782,10 @@ class RailEdgeBot:
                             seq += 1
                             request_id = f"{exchange}-{seq}-{action['role']}"
                             if action.get("type") == "cancel_order":
-                                # drop the live order locally now so the
-                                # next plan can't double-cancel.
+                                if self.verbose:
+                                    print(f"[{exchange}] CANCEL "
+                                          f"oid={action['order_id']} ({action['role']})",
+                                          flush=True)
                                 state.drop_order(int(action["order_id"]))
                                 await self._send_json(
                                     ws, limiter,
@@ -776,6 +796,13 @@ class RailEdgeBot:
                                     ),
                                 )
                                 continue
+                            if self.verbose:
+                                print(f"[{exchange}] SEND "
+                                      f"{action['role']:>13s} "
+                                      f"{action['side']} {action['quantity']:4d} "
+                                      f"@ ${action['price']/100:>6.2f} "
+                                      f"({action['order_type']})",
+                                      flush=True)
                             pending_order = PendingOrder(
                                 local_id=request_id,
                                 instrument=action["instrument_id"],
@@ -927,6 +954,15 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ORDER_TTL_MS,
         help="Expiry horizon for resting rail orders and IOC requests.",
     )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Log every order sent (otherwise only fills, rejections, "
+             "connection events, and the periodic heartbeat are printed).",
+    )
+    parser.add_argument(
+        "--heartbeat-s", type=float, default=5.0,
+        help="Seconds between per-exchange state heartbeats. 0 to disable.",
+    )
     return parser.parse_args()
 
 
@@ -945,6 +981,8 @@ def main() -> None:
         configs,
         rate_limit=args.rate_limit,
         order_ttl_ms=args.order_ttl_ms,
+        verbose=args.verbose,
+        heartbeat_every_s=args.heartbeat_s,
     )
     asyncio.run(bot.run())
 

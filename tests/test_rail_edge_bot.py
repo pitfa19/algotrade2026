@@ -39,14 +39,16 @@ class RailEdgeStrategyTests(unittest.TestCase):
                          (config.low_bid_price, config.lot_size))
         self.assertEqual(asks, [])
 
-    def test_with_short_rail_explicitly_enabled_an_ask_is_planned(self):
+    def test_with_high_rail_enabled_an_ask_is_planned(self):
+        # both flags must flip on: enable_high_rail to put the rail up at all,
+        # and allow_short_rail to size against MAX_SHORT when flat.
         config = default_rail_configs()["NASDAQ"]
-        # toggle the (off-by-default) experimental short-rail
         config = RailConfig(
             exchange=config.exchange, symbol=config.symbol,
             low_bid_price=config.low_bid_price, high_ask_price=config.high_ask_price,
             close_bid_min=config.close_bid_min, close_ask_max=config.close_ask_max,
-            lot_size=config.lot_size, allow_short_rail=True,
+            lot_size=config.lot_size,
+            allow_short_rail=True, enable_high_rail=True,
             force_close_after_ms=config.force_close_after_ms,
         )
         state = synced_state(exchange="NASDAQ")
@@ -72,16 +74,25 @@ class RailEdgeStrategyTests(unittest.TestCase):
         bids = [o for o in orders if o["side"] == "bid"]
         self.assertEqual(bids, [])
 
-    def test_long_inventory_places_high_rail_ask_capped_at_lot_size(self):
-        config = default_rail_configs()["NASDAQ"]
+    def test_long_inventory_places_high_rail_ask_when_explicitly_enabled(self):
+        # default leaves enable_high_rail=False — the rail ask would
+        # block close/force_close from putting up exit orders. Test the
+        # opt-in path here.
+        base = default_rail_configs()["NASDAQ"]
+        config = RailConfig(
+            exchange=base.exchange, symbol=base.symbol,
+            low_bid_price=base.low_bid_price, high_ask_price=base.high_ask_price,
+            close_bid_min=base.close_bid_min, close_ask_max=base.close_ask_max,
+            lot_size=base.lot_size,
+            allow_short_rail=base.allow_short_rail, enable_high_rail=True,
+            force_close_after_ms=base.force_close_after_ms,
+        )
         state = synced_state(exchange="NASDAQ")
         state.positions["NASDAQ-CARD"] = 350
         strategy = RailEdgeStrategy(config)
 
         orders = strategy.plan_orders(state, depth=None, now_ms=1_500)
         asks = [order for order in orders if order["side"] == "ask"]
-
-        # cap at lot_size; one ticket per tick (planner re-arms on next tick)
         self.assertEqual(len(asks), 1)
         self.assertEqual(asks[0]["price"], config.high_ask_price)
         self.assertEqual(asks[0]["quantity"], config.lot_size)
