@@ -54,6 +54,12 @@ class HegeCoreTests(unittest.TestCase):
         self.assertFalse(risk.approve("ZSE", "ZSE-CARD", "ask", 10000, 170, reduce_only=False).ok)
         self.assertTrue(risk.approve("ZSE", "ZSE-CARD", "ask", 10000, 10, reduce_only=True).ok)
 
+    def test_live_trading_env_disables_dry_run(self):
+        cfg = hege.Config.from_env({"LIVE_TRADING": "1"})
+
+        self.assertTrue(cfg.live_trading)
+        self.assertFalse(cfg.dry_run)
+
     def test_candidate_scores_do_not_penalize_far_venues_when_physical_latency_removed(self):
         cfg = hege.Config.from_env({"BOT_HOME": "NYSE"})
         signal = hege.Signal(
