@@ -107,25 +107,41 @@ class PendingOrder:
 class ExchangeState:
     exchange: str
     cash: int = INITIAL_CASH
+    # Truth from the most recent get_inventory_response.
+    #   reserved_cash  = data["$"][0]       — cash locked in resting bids
+    #   reserved_qty[I]= data[I][0]         — shares locked in resting asks of I
+    # We use these to compute EXACT free cash / free shares so a new order
+    # cannot overshoot the server's hard limits.
+    reserved_cash: int = 0
     positions: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    reserved_qty: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     live_orders: dict[int, LiveOrder] = field(default_factory=dict)
     inflight_orders: dict[str, PendingOrder] = field(default_factory=dict)
     # last time (server ms) at which `position(instrument)` crossed back to 0
     last_flat_ms: dict[str, int] = field(default_factory=dict)
+    inventory_synced: bool = False
+    pending_orders_synced: bool = False
 
     def position(self, instrument: str) -> int:
         return int(self.positions.get(instrument, 0))
 
+    def reserved_for(self, instrument: str) -> int:
+        return int(self.reserved_qty.get(instrument, 0))
+
+    def is_synced(self) -> bool:
+        return self.inventory_synced and self.pending_orders_synced
+
     def apply_inventory(self, data: dict[str, list[int]]) -> None:
         cash_pair = data.get("$")
         if cash_pair is not None:
-            # data["$"] = [reserved, total]; we trust `total` and let our
-            # local `pending_bid_value()` carry the reservation accounting.
+            self.reserved_cash = int(cash_pair[0])
             self.cash = int(cash_pair[1])
         for instrument, pair in data.items():
             if instrument == "$":
                 continue
+            self.reserved_qty[instrument] = int(pair[0])
             self.positions[instrument] = int(pair[1])
+        self.inventory_synced = True
 
     def track_order(
         self,
@@ -201,24 +217,67 @@ class ExchangeState:
         )
         return live_value + inflight_value
 
+    def inflight_bid_value(self) -> int:
+        """Bids we've sent but the server has not yet ack'd (and therefore
+        not yet added to its `reserved_cash` accounting). Anything in
+        `live_orders` is *already* in server `reserved_cash`."""
+        return sum(
+            max(0, order.quantity) * int(order.price or 0)
+            for order in self.inflight_orders.values()
+            if order.side == "bid"
+        )
+
+    def inflight_ask_qty(self, instrument: str) -> int:
+        """Asks we've sent but the server has not yet ack'd."""
+        return sum(
+            max(0, order.quantity)
+            for order in self.inflight_orders.values()
+            if order.side == "ask" and order.instrument == instrument
+        )
+
+    def free_cash(self) -> int:
+        """Cash the server would still let us reserve right now: total
+        balance − what's already reserved server-side − what we've sent
+        and not yet had ack'd. Subtract the hard floor to get the
+        maximum bid value we can still issue."""
+        return self.cash - self.reserved_cash - self.inflight_bid_value() - CASH_FLOOR
+
+    def free_qty(self, instrument: str) -> int:
+        """Shares we can put into a NEW resting ask: position −
+        already-reserved-by-resting-asks − inflight-asks."""
+        return (
+            self.position(instrument)
+            - self.reserved_for(instrument)
+            - self.inflight_ask_qty(instrument)
+        )
+
 
 
 def default_rail_configs() -> dict[str, RailConfig]:
-    # close thresholds intentionally near the natural mid (~$100). The rail
-    # already locked in $20+/share of edge at the rail-fill price; the close
-    # only needs to *fire reliably* to recycle inventory. The force-close
-    # path (5s default) is the safety net behind these.
+    # Rails are TAIL CATCHERS: they should only fill when a market order
+    # walks the book deep enough to leave the touch. Prices like $105 or
+    # $129 sit too close to where CARD/SIMP actually trade, so the rail
+    # ends up crossing the touch on every other tick — which on the
+    # short-resting side fails as "Insufficient inventory" against a flat
+    # account. Pushing them well outside the typical range fixes this.
+    #
+    # low_bid  = $50  → only fills if a giant market-sell walks through every
+    #                   higher resting bid (rare, but the whole edge).
+    # high_ask = $150 → only fills when we already own shares AND a giant
+    #                   market-buy lifts the asks past $150.
+    # close thresholds straddle the natural ~$100 mid so the polite IOC
+    # close fires reliably; the 5s force-close is the backstop.
     return {
-        "NASDAQ":   RailConfig("NASDAQ",   "CARD", 7001, 11000, 9900, 10100),
-        "ZSE":      RailConfig("ZSE",      "CARD", 7001, 11000, 9900, 10100),
-        "SSE":      RailConfig("SSE",      "CARD", 7001, 10500, 9900, 10100),
-        "LSE":      RailConfig("LSE",      "CARD", 7001, 11000, 9900, 10100),
-        "JPX":      RailConfig("JPX",      "CARD", 7001, 10500, 9900, 10100),
-        "NSE":      RailConfig("NSE",      "SIMP", 7001, 12999, 9900, 10100),
-        "HKEX":     RailConfig("HKEX",     "SIMP", 7001, 12900, 9900, 10100),
-        "NYSE":     RailConfig("NYSE",     "CARD", 7001, 11000, 9900, 10100),
-        "TMX":      RailConfig("TMX",      "CARD", 7001, 10500, 9900, 10100),
-        "Euronext": RailConfig("Euronext", "SIMP", 7001, 12999, 9900, 10100),
+        "NASDAQ":   RailConfig("NASDAQ",   "CARD", 5000, 15000, 9900, 10100),
+        "ZSE":      RailConfig("ZSE",      "CARD", 5000, 15000, 9900, 10100),
+        "SSE":      RailConfig("SSE",      "CARD", 5000, 15000, 9900, 10100),
+        "LSE":      RailConfig("LSE",      "CARD", 5000, 15000, 9900, 10100),
+        "JPX":      RailConfig("JPX",      "CARD", 5000, 15000, 9900, 10100),
+        "NSE":      RailConfig("NSE",      "SIMP", 5000, 15000, 9900, 10100),
+        "HKEX":     RailConfig("HKEX",     "SIMP", 5000, 15000, 9900, 10100),
+        "NYSE":     RailConfig("NYSE",     "CARD", 5000, 15000, 9900, 10100),
+        "TMX":      RailConfig("TMX",      "CARD", 5000, 15000, 9900, 10100),
+        "Euronext": RailConfig("Euronext", "SIMP", 5000, 15000, 9900, 10100),
     }
 
 
@@ -273,56 +332,55 @@ class RailEdgeStrategy:
         depth: dict[str, dict[str, int]] | None,
         now_ms: int,
     ) -> list[dict[str, Any]]:
+        # If we haven't had our first inventory + pending-orders snapshot
+        # yet, do not plan: any sizing would be against ghost defaults and
+        # the server will reject (Insufficient balance / inventory).
+        if not state.is_synced():
+            return []
+
         instrument = self.config.instrument
         orders: list[dict[str, Any]] = []
 
         # 1. Force-flatten if inventory has been held past the timeout.
-        #    The rail edge is already realized at the rail-fill price; this is
-        #    a capital-recycling primitive, not a PnL-seeking one.
         force_close = self._plan_force_close(state, now_ms)
         if force_close is not None:
             orders.append(force_close)
 
         # 2. Polite IOC close at the configured "fair" thresholds.
         close_order = self._plan_close_order(state, depth)
-        ask_reserved_this_tick = 0
-        bid_reserved_this_tick = 0
         if close_order is not None:
             orders.append(close_order)
-            if close_order["side"] == "ask":
-                ask_reserved_this_tick = int(close_order["quantity"])
-            else:
-                bid_reserved_this_tick = int(close_order["quantity"])
-        if force_close is not None:
-            if force_close["side"] == "ask":
-                ask_reserved_this_tick += int(force_close["quantity"])
-            else:
-                bid_reserved_this_tick += int(force_close["quantity"])
 
-        # 3. Re-arm rails (limit orders, capped per ticket).
-        bid_qty = self._rail_bid_quantity(state, bid_reserved_this_tick)
+        # Reservations made by close + force_close, in the units each
+        # downstream sizer needs:
+        #   ask sizer wants SHARES (we'd be reducing free_qty)
+        #   bid sizer wants VALUE  (we'd be reducing free_cash)
+        extra_ask_qty   = 0
+        extra_bid_value = 0
+        for o in orders:
+            if o["side"] == "ask":
+                extra_ask_qty   += int(o["quantity"])
+            else:
+                extra_bid_value += int(o["quantity"]) * int(o.get("price") or 0)
+
+        # 3. Re-arm rails.
+        bid_qty = self._rail_bid_quantity(state, extra_bid_value)
         if bid_qty > 0:
             orders.append(
                 self._order(
-                    instrument=instrument,
-                    side="bid",
-                    price=self.config.low_bid_price,
-                    quantity=bid_qty,
-                    order_type="limit",
-                    role="rail",
+                    instrument=instrument, side="bid",
+                    price=self.config.low_bid_price, quantity=bid_qty,
+                    order_type="limit", role="rail",
                 )
             )
 
-        ask_qty = self._rail_ask_quantity(state, ask_reserved_this_tick)
+        ask_qty = self._rail_ask_quantity(state, extra_ask_qty)
         if ask_qty > 0:
             orders.append(
                 self._order(
-                    instrument=instrument,
-                    side="ask",
-                    price=self.config.high_ask_price,
-                    quantity=ask_qty,
-                    order_type="limit",
-                    role="rail",
+                    instrument=instrument, side="ask",
+                    price=self.config.high_ask_price, quantity=ask_qty,
+                    order_type="limit", role="rail",
                 )
             )
 
@@ -374,71 +432,77 @@ class RailEdgeStrategy:
 
         instrument = self.config.instrument
         pos = state.position(instrument)
+
         if pos > 0:
-            qty = visible_qty_at_or_better(depth.get("bids", {}), self.config.close_bid_min, "bid")
-            qty = min(pos, qty)
+            # SELL into ≥ close_bid_min bids. Cap at FREE shares — i.e.
+            # owned minus what's already reserved by other resting/inflight
+            # asks — so we never request to sell more than we own.
+            free = state.free_qty(instrument)
+            qty = min(free, pos,
+                      visible_qty_at_or_better(depth.get("bids", {}),
+                                               self.config.close_bid_min, "bid"))
             if qty > 0:
                 return self._order(
-                    instrument=instrument,
-                    side="ask",
-                    price=self.config.close_bid_min,
-                    quantity=qty,
-                    order_type="ioc",
-                    role="close",
+                    instrument=instrument, side="ask",
+                    price=self.config.close_bid_min, quantity=qty,
+                    order_type="ioc", role="close",
                 )
 
         if pos < 0:
-            qty = visible_qty_at_or_better(depth.get("asks", {}), self.config.close_ask_max, "ask")
-            qty = min(-pos, qty)
+            # BUY against ≤ close_ask_max asks. The cash needed = qty * limit;
+            # cap by free_cash so we never overshoot the cash floor.
+            need_qty = -pos
+            visible = visible_qty_at_or_better(depth.get("asks", {}),
+                                               self.config.close_ask_max, "ask")
+            cash_qty = state.free_cash() // self.config.close_ask_max
+            qty = max(0, min(need_qty, visible, cash_qty))
             if qty > 0:
                 return self._order(
-                    instrument=instrument,
-                    side="bid",
-                    price=self.config.close_ask_max,
-                    quantity=qty,
-                    order_type="ioc",
-                    role="close",
+                    instrument=instrument, side="bid",
+                    price=self.config.close_ask_max, quantity=qty,
+                    order_type="ioc", role="close",
                 )
 
         return None
 
-    def _rail_bid_quantity(self, state: ExchangeState, extra_reserved: int = 0) -> int:
-        """Top up the resting rail bid to `lot_size` shares total.
+    def _rail_bid_quantity(self, state: ExchangeState, extra_reserved_value: int = 0) -> int:
+        """Exact bid sizing using server truth.
 
-        Crucially, lot_size is a TARGET (how much we want resting at the
-        rail price), not a per-tick add. Without this distinction the bot
-        re-issued lot_size shares every tick, stacking reservations until
-        the exchange rejected with "Insufficient balance".
+        `state.free_cash()` returns the most cash we can still spend: total −
+        already-reserved − inflight-bids − hard floor. The new bid's value
+        plus any same-tick close reservation MUST stay within that.
         """
         instrument = self.config.instrument
+        # 1. respect the resting-target cap (don't stack)
         pending_qty = state.pending_qty(
             instrument, side="bid", price=self.config.low_bid_price, role="rail"
-        ) + int(extra_reserved)
-        # how many more we can add WITHOUT busting the resting target
+        )
         target_room = max(0, int(self.config.lot_size) - pending_qty)
-        # how many more we can add without busting the soft position cap
-        position_room = max(0, SOFT_MAX_LONG - state.position(instrument) - pending_qty)
-        # how many more we can afford while staying above the SOFT cash floor
-        cash_room = state.cash - state.pending_bid_value() - SOFT_CASH_FLOOR
-        cash_qty = max(0, cash_room // self.config.low_bid_price)
+        # 2. respect the position ceiling
+        position_room = max(0, MAX_LONG - state.position(instrument) - pending_qty)
+        # 3. EXACT cash check: take the server's free cash, subtract any
+        #    cash we've reserved THIS tick (close BIDs covering shorts),
+        #    and divide by the bid price.
+        free = state.free_cash() - int(extra_reserved_value)
+        cash_qty = max(0, free // self.config.low_bid_price)
         return max(0, min(target_room, position_room, cash_qty))
 
-    def _rail_ask_quantity(self, state: ExchangeState, extra_reserved: int = 0) -> int:
-        """Top up the resting rail ask to `lot_size` shares — but only
-        against shares we actually own. The exchange rejects resting asks
-        beyond the held position with "Insufficient inventory"."""
+    def _rail_ask_quantity(self, state: ExchangeState, extra_reserved_qty: int = 0) -> int:
+        """Exact ask sizing: only sell shares we *actually own and aren't
+        already trying to sell*. `state.free_qty()` is position −
+        server-reserved-by-resting-asks − inflight-asks."""
         instrument = self.config.instrument
-        pos = state.position(instrument)
-        if self.config.allow_short_rail:
-            # Optimistic: try to short down to the soft floor. Only safe if
-            # the venue accepts resting asks against future short positions.
-            owned = pos - SOFT_MAX_SHORT
-        else:
-            owned = max(0, pos)
-        pending_qty = state.pending_qty(instrument, side="ask") + int(extra_reserved)
+        pending_qty = state.pending_qty(instrument, side="ask", role="rail")
         target_room = max(0, int(self.config.lot_size) - pending_qty)
-        capacity   = max(0, owned - pending_qty)
-        return max(0, min(target_room, capacity))
+        free = state.free_qty(instrument) - int(extra_reserved_qty)
+        if self.config.allow_short_rail:
+            # If shorting via resting asks is permitted on this venue,
+            # extend capacity down to MAX_SHORT.
+            free = max(free, state.position(instrument) - MAX_SHORT
+                       - state.reserved_for(instrument)
+                       - state.inflight_ask_qty(instrument)
+                       - int(extra_reserved_qty))
+        return max(0, min(target_room, free))
 
     @staticmethod
     def _order(
@@ -597,12 +661,21 @@ class RailEdgeBot:
                                 exchange, state, strategy, pending, message
                             )
                             if had_immediate_fill:
-                                # bring our cash view back in sync immediately
+                                # Re-sync BOTH inventory and pending orders —
+                                # a fill or rejection means our local
+                                # reserved_cash / reserved_qty are now stale
+                                # relative to the server.
                                 seq += 1
                                 await self._send_json(
                                     ws, limiter,
                                     {"type": "get_inventory",
                                      "user_request_id": f"{exchange}-{seq}-postfill"},
+                                )
+                                seq += 1
+                                await self._send_json(
+                                    ws, limiter,
+                                    {"type": "get_pending_orders",
+                                     "user_request_id": f"{exchange}-{seq}-postfill-pend"},
                                 )
                             continue
 
@@ -724,6 +797,7 @@ class RailEdgeBot:
         local view matches what the server has resting. Without this, any
         rail order that survived a reconnect would be invisible to
         pending_bid_value() and we'd over-deploy cash."""
+        state.pending_orders_synced = True
         for instrument, sides in (data or {}).items():
             if not isinstance(sides, list) or len(sides) != 2:
                 continue

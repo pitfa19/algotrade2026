@@ -12,12 +12,23 @@ from rail_edge_bot import (
 )
 
 
+def synced_state(exchange: str, **kwargs) -> ExchangeState:
+    """Tests construct ExchangeState directly without going through the
+    inventory/pending-orders message path. Production code skips planning
+    until is_synced()==True, so flip both flags here so the tests can
+    exercise the planner."""
+    state = ExchangeState(exchange=exchange, **kwargs)
+    state.inventory_synced = True
+    state.pending_orders_synced = True
+    return state
+
+
 class RailEdgeStrategyTests(unittest.TestCase):
     def test_flat_account_places_only_cash_backed_bid_at_lot_size(self):
         # Default config has allow_short_rail=False — server rejects resting
         # asks beyond owned shares with "Insufficient inventory".
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ")
+        state = synced_state(exchange="NASDAQ")
         strategy = RailEdgeStrategy(config)
 
         orders = strategy.plan_orders(state, depth=None, now_ms=1_000)
@@ -38,7 +49,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
             lot_size=config.lot_size, allow_short_rail=True,
             force_close_after_ms=config.force_close_after_ms,
         )
-        state = ExchangeState(exchange="NASDAQ")
+        state = synced_state(exchange="NASDAQ")
         strategy = RailEdgeStrategy(config)
         orders = strategy.plan_orders(state, depth=None, now_ms=1_000)
         asks = [o for o in orders if o["side"] == "ask"]
@@ -49,7 +60,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
         # The previous-tick bid (still inflight or resting) must NOT trigger
         # a duplicate bid. lot_size is a target, not a per-tick add.
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ")
+        state = synced_state(exchange="NASDAQ")
         state.track_order(
             local_id="resting", order_id=1,
             instrument="NASDAQ-CARD", side="bid",
@@ -63,7 +74,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
 
     def test_long_inventory_places_high_rail_ask_capped_at_lot_size(self):
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ")
+        state = synced_state(exchange="NASDAQ")
         state.positions["NASDAQ-CARD"] = 350
         strategy = RailEdgeStrategy(config)
 
@@ -72,12 +83,12 @@ class RailEdgeStrategyTests(unittest.TestCase):
 
         # cap at lot_size; one ticket per tick (planner re-arms on next tick)
         self.assertEqual(len(asks), 1)
-        self.assertEqual(asks[0]["price"], 11000)
+        self.assertEqual(asks[0]["price"], config.high_ask_price)
         self.assertEqual(asks[0]["quantity"], config.lot_size)
 
     def test_passive_rail_fill_updates_position_cash_and_remaining_order(self):
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ")
+        state = synced_state(exchange="NASDAQ")
         state.track_order(
             local_id="rail-bid-1",
             order_id=42,
@@ -106,7 +117,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
 
     def test_long_position_closes_only_against_visible_bids_above_threshold(self):
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ")
+        state = synced_state(exchange="NASDAQ")
         state.positions["NASDAQ-CARD"] = 620
         strategy = RailEdgeStrategy(config)
 
@@ -142,7 +153,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
 
     def test_short_position_closes_only_against_visible_asks_below_threshold(self):
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ")
+        state = synced_state(exchange="NASDAQ")
         state.positions["NASDAQ-CARD"] = -120
         strategy = RailEdgeStrategy(config)
 
@@ -168,7 +179,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
 
     def test_cash_and_pending_bids_limit_new_rail_bid_quantity_to_positive_available_cash(self):
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ", cash=10_000_000)
+        state = synced_state(exchange="NASDAQ", cash=10_000_000)
         state.track_order(
             local_id="old-bid",
             order_id=7,
@@ -192,7 +203,7 @@ class RailEdgeStrategyTests(unittest.TestCase):
         # the bot deploys capital down to CASH_FLOOR (-$50k); below that the
         # exchange would reject the bid for insufficient balance.
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ", cash=-5_000_000)
+        state = synced_state(exchange="NASDAQ", cash=-5_000_000)
         strategy = RailEdgeStrategy(config)
 
         orders = strategy.plan_orders(state, depth=None, now_ms=4_500)
@@ -202,13 +213,13 @@ class RailEdgeStrategyTests(unittest.TestCase):
 
     def test_inflight_rail_orders_count_as_reserved_capacity(self):
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ")
+        state = synced_state(exchange="NASDAQ")
         state.track_inflight(
             PendingOrder(
                 local_id="pending-rail",
                 instrument="NASDAQ-CARD",
                 side="bid",
-                price=7001,
+                price=default_rail_configs()["NASDAQ"].low_bid_price,
                 quantity=2000,
                 order_type="limit",
                 role="rail",
@@ -223,25 +234,15 @@ class RailEdgeStrategyTests(unittest.TestCase):
 
 
 class CashReservationTests(unittest.TestCase):
-    def test_pending_bid_value_blocks_new_bids_against_soft_floor(self):
-        # Local pending bid reservations + soft floor must keep us from
-        # over-deploying even if the server-side reservation count drifts.
-        # Setup: cash $100k, $140k worth of bids already pending → free
-        # cash would dip below the soft −$45k floor, no new bid.
+    def test_server_reserved_cash_blocks_new_bids_against_hard_floor(self):
+        # When the server tells us cash=$100k of which $140k is reserved
+        # (impossible in practice but mathematically equivalent to "we're
+        # already past the floor"), we must NOT issue another bid. The
+        # exact-sizing path subtracts reserved_cash directly from free_cash.
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ", cash=10_000_000)
-        for i in range(10):
-            state.track_order(
-                local_id=f"resting-{i}",
-                order_id=100 + i,
-                instrument="NASDAQ-CARD",
-                side="bid",
-                price=7001,
-                quantity=2000,    # 2000 × $70 ≈ $140k each
-                role="rail",
-            )
-            break  # one big resting order is enough to overflow
-        # one resting bid worth $140k blows the soft floor → no new bid
+        state = synced_state(exchange="NASDAQ")
+        # server reserved == total + |hard floor| → free cash exactly at floor
+        state.apply_inventory({"$": [15_000_000, 10_000_000]})
         strategy = RailEdgeStrategy(config)
         orders = strategy.plan_orders(state, depth=None, now_ms=1_000)
         bids = [o for o in orders if o["side"] == "bid"]
@@ -249,7 +250,7 @@ class CashReservationTests(unittest.TestCase):
 
     def test_inventory_total_field_is_what_drives_cash(self):
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ")
+        state = synced_state(exchange="NASDAQ")
         # data["$"] = [reserved, total]; we trust total
         state.apply_inventory({"$": [3_000_000, 8_000_000]})
         self.assertEqual(state.cash, 8_000_000)
@@ -258,7 +259,7 @@ class CashReservationTests(unittest.TestCase):
 class ForceCloseTests(unittest.TestCase):
     def test_long_inventory_force_closes_with_market_after_timeout(self):
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ")
+        state = synced_state(exchange="NASDAQ")
         state.positions["NASDAQ-CARD"] = 200
         state.last_flat_ms["NASDAQ-CARD"] = 1_000
         strategy = RailEdgeStrategy(config)
@@ -278,7 +279,7 @@ class ForceCloseTests(unittest.TestCase):
 
     def test_short_inventory_force_closes_with_market_after_timeout(self):
         config = default_rail_configs()["NASDAQ"]
-        state = ExchangeState(exchange="NASDAQ")
+        state = synced_state(exchange="NASDAQ")
         state.positions["NASDAQ-CARD"] = -150
         state.last_flat_ms["NASDAQ-CARD"] = 0
         strategy = RailEdgeStrategy(config)
