@@ -740,7 +740,7 @@ small venue subset.
 ### `cascade.py`
 
 Purpose: surgical descendant of `prism.py`. Same strategies, same thresholds,
-same defensive bits — three execution-quality changes only:
+same defensive bits — four execution-quality changes only:
 
 1. **Depth-walked ETF basket arb.** The ETF leg walks every ask/bid level
    that still beats `ARB_EDGE` on its marginal price, instead of stopping
@@ -748,15 +748,24 @@ same defensive bits — three execution-quality changes only:
    server price-time priority gives price improvement on shallower levels.
    Same edge floor, same risk-per-share, ~3× the size on the same
    opportunity when the MM is mispriced through multiple levels.
-2. **Plan ranking.** When multiple arb plans land on one tick, the
-   highest-edge plan fires first so it consumes position/cash headroom
-   before the smaller ones do.
-3. **Faster reconnect.** `MAX_BACKOFF_S` lowered from `4.0` to `1.5`. With
+2. **Plan ranking with location-aware tiebreaker.** When multiple arb plans
+   land on one tick, the highest-edge plan fires first. Ties are broken by
+   the plan whose worst leg is on the closest exchange, since high-latency
+   legs are more likely to race-fail.
+3. **Location detection via `/health`.** On every WebSocket welcome, cascade
+   probes `GET http://<host>:9001/health` to measure RTT and to pull the
+   server-reported `round_length`. The lowest-RTT exchange is logged as the
+   detected home venue (auto-tracks the segment rotation NYSE → ZSE → HKEX).
+   The probe is non-blocking — runs on a worker thread, no impact on the
+   trading loop.
+4. **Faster reconnect.** `MAX_BACKOFF_S` lowered from `4.0` to `1.5`. With
    3 segment boundaries per round, this returns 5–10 s of trade time.
 
-Verified empirically on a stacked-edge synthetic book: prism takes `k=8`
-baskets at top-of-book, cascade takes `k=25`. On a thin book with only
-top-of-book having edge, cascade and prism produce identical plans.
+Verified empirically:
+- Stacked-edge synthetic book: prism takes `k=8` baskets, cascade takes `k=25`.
+- Thin synthetic book (only top-of-book has edge): cascade matches prism.
+- RTT tiebreaker on tied edges: near plan beats far plan; higher-edge plan
+  always wins regardless of RTT; no-RTT-data falls back to stable insertion order.
 
 Subset test run:
 

@@ -61,6 +61,7 @@ import os
 import random
 import signal
 import time
+import urllib.request
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Optional
@@ -340,6 +341,11 @@ class Hub:
         # Server-time view per exchange
         self.server_time: dict[str, int] = {}
         self.round_length: dict[str, int] = {v: DEFAULT_ROUND_MS for v in active_venues}
+        # Per-exchange RTT (ms) from /health probe on connect. Used as a tiebreaker
+        # in plan ranking — when two plans have the same edge, the one whose
+        # slowest leg is closest to us fires first (less legging-race risk).
+        self.rtt_ms: dict[str, float] = {}
+        self.home_venue: Optional[str] = None
         # ready[ex] is False right after a (re)connect until get_inventory replies.
         # We don't trade on an unready exchange -- prevents wrong-way trades from
         # acting on stale local position state.
@@ -489,6 +495,43 @@ class Hub:
                 "type": "get_pending_orders",
                 "user_request_id": self.req_id(f"pend-{exchange}"),
             })
+        # Probe /health for RTT and round_length.  Non-blocking — runs the
+        # blocking HTTP GET on a worker thread.  Updates self.rtt_ms[exchange]
+        # and recomputes self.home_venue.
+        with contextlib.suppress(RuntimeError):
+            asyncio.create_task(self._probe_health(exchange))
+
+    async def _probe_health(self, exchange: str) -> None:
+        """HTTP GET /health on the same host:9001.  One-shot per (re)connect.
+        Records RTT (used as plan-ranking tiebreaker) and updates round_length
+        from the server-reported value (was hard-coded to DEFAULT_ROUND_MS)."""
+        url = f"http://{WS_HOSTS[exchange]}:9001/health"
+
+        def _do_req() -> tuple[Optional[float], Optional[dict]]:
+            t0 = time.monotonic()
+            try:
+                with urllib.request.urlopen(url, timeout=2.0) as resp:
+                    rtt_ms = (time.monotonic() - t0) * 1000.0
+                    return rtt_ms, json.loads(resp.read())
+            except Exception:
+                return None, None
+
+        rtt_ms, data = await asyncio.to_thread(_do_req)
+        if rtt_ms is None:
+            return
+        self.rtt_ms[exchange] = rtt_ms
+        if isinstance(data, dict):
+            rl = data.get("round_length")
+            if isinstance(rl, int) and rl > 0:
+                self.round_length[exchange] = rl
+        # Recompute home venue (lowest measured RTT so far).
+        prev_home = self.home_venue
+        home = min(self.rtt_ms, key=lambda v: self.rtt_ms[v])
+        self.home_venue = home
+        log.info("%s rtt=%.1fms round_length=%dms",
+                 exchange, rtt_ms, self.round_length[exchange])
+        if home != prev_home:
+            log.info("co-location: home=%s rtt=%.1fms", home, self.rtt_ms[home])
 
     def on_md(self, exchange: str, msg: dict) -> None:
         t = msg.get("time")
@@ -626,8 +669,15 @@ class Hub:
         plans += self.settlement_unwind()
         # Fire highest-edge plans first so when a tick produces several arbs
         # the most profitable ones consume position/cash headroom before the
-        # smaller ones do.
-        plans.sort(key=lambda p: -p.edge_cents)
+        # smaller ones do.  Tiebreaker: prefer the plan whose worst leg is on
+        # the closest exchange — less legging-race risk on a tied edge.
+        def _rank(p: Plan) -> tuple[float, float]:
+            worst_leg_rtt = max(
+                (self.rtt_ms.get(l.exchange, 0.0) for l in p.legs),
+                default=0.0,
+            )
+            return (-p.edge_cents, worst_leg_rtt)
+        plans.sort(key=_rank)
         for plan in plans:
             self.fire(plan)
 
@@ -645,7 +695,8 @@ class Hub:
                     total_pos_val += int(self.pos[(ex, tk)] * bk.mid)
             total_cash = sum(self.cash.values())
             log.info(
-                "[hb] books=%d cash=$%.0f pos_mtm=$%.0f fills=%d realized=$%.0f open=%d live_lim=%d",
+                "[hb] home=%s books=%d cash=$%.0f pos_mtm=$%.0f fills=%d realized=$%.0f open=%d live_lim=%d",
+                self.home_venue or "?",
                 book_count,
                 total_cash / 100,
                 total_pos_val / 100,
