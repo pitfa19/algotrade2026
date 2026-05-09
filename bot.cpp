@@ -364,6 +364,8 @@ public:
  *
  * This does NOT trade. Replace with your own logic.
  */
+#include <unordered_set>
+
 class SimpleStrategy : public Strategy {
 public:
     void on_connected(Bot& bot, const std::string& exchange) override {
@@ -375,27 +377,22 @@ public:
                         const std::string& exchange,
                         const MarketState& state) override {
 
-        // 1. Load universes
         auto nyse_instruments = state.instruments_on("NYSE");
         auto exec_instruments = state.instruments_on(exchange);
 
         if (nyse_instruments.empty() || exec_instruments.empty())
             return;
 
-        // 2. Build fast lookup set for NYSE symbols
         std::unordered_set<std::string> nyse_set(
             nyse_instruments.begin(),
             nyse_instruments.end()
         );
 
-        // 3. Iterate execution exchange symbols
         for (const auto& symbol : exec_instruments) {
 
-            // only trade if symbol exists on NYSE
             if (!nyse_set.count(symbol))
                 continue;
 
-            // 4. Get order books
             auto nyse = state.get_book("NYSE", symbol);
             auto exec_book = state.get_book(exchange, symbol);
 
@@ -411,43 +408,40 @@ public:
             if (!n_bid || !n_ask || !e_bid || !e_ask)
                 continue;
 
-            // 5. Compute mid prices
             double nyse_mid = (*n_bid + *n_ask) * 0.5;
             double exec_mid = (*e_bid + *e_ask) * 0.5;
 
             double diff = nyse_mid - exec_mid;
 
             const double threshold = 0.05;
+            int qty = 100;
 
-            // 6. Trading logic (NYSE leads)
+            // BUY signal: exec is cheaper than NYSE
             if (diff > threshold) {
-
-                // NYSE higher → expect move up on exec exchange
-                bot.buy(exchange, symbol, 100);
+                int price = *e_ask; // buy at ask
+                bot.place_order(exchange, symbol, "buy", price, qty);
             }
 
+            // SELL signal: exec is more expensive than NYSE
             if (diff < -threshold) {
-
-                // NYSE lower → expect move down on exec exchange
-                bot.sell(exchange, symbol, 100);
+                int price = *e_bid; // sell at bid
+                bot.place_order(exchange, symbol, "sell", price, qty);
             }
         }
     }
 
     void on_fill(Bot& bot, const Fill& fill) override {
         (void)bot;
-        std::cout << "[SimpleStrategy] FILL on " << fill.exchange << ": "
-                  << fill.instrument_id << " " << fill.side
-                  << " " << fill.quantity << "@" << fill.price << "\n";
+        std::cout << "[SimpleStrategy] FILL "
+                  << fill.exchange << " "
+                  << fill.instrument_id << " "
+                  << fill.quantity << "@" << fill.price << "\n";
     }
 
     void on_round_end(Bot& bot, const std::string& exchange) override {
         (void)bot;
         std::cout << "[SimpleStrategy] Round ended on " << exchange << "\n";
     }
-
-private:
-    std::map<std::string, int> tick_count_;
 };
 
 
