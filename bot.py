@@ -56,11 +56,17 @@ SERVER_POS_FLOOR = -200          # per instrument
 SERVER_POS_CEIL = 2000           # per instrument
 SERVER_CASH_FLOOR = -5_000_000   # cents
 
-# Local strategy params (conservative).
+# Local strategy params.
 LOCAL_RATE_LIMIT = 400           # 80% of server limit
-ARB_SIZE = 5                     # shares per IOC fire (per leg)
-ARB_THRESHOLD = 30               # cents of edge before crossing
-ETF_POS_CAP = 20                 # max |ETF position| we'll open
+ARB_SIZE = 20                    # shares per IOC fire (per leg).
+                                 # Fits inside MM's 50-deep top level so an IOC
+                                 # at touch fully fills without slipping levels.
+ARB_THRESHOLD = 25               # cents of per-share edge before crossing
+ETF_POS_CAP = 80                 # max |ETF position| we'll open per ETF.
+                                 # Constraint: NGUP/KTST/XFR sit in BOTH ETFA
+                                 # and ETFA3 (same for KOTD/INA/DLKV in ETFB/B3),
+                                 # so a constituent's worst-case short =
+                                 # 2 * ETF_POS_CAP. Must stay < |-200| floor.
 EXPIRY_MS = 5_000                # IOC expiry window (effectively immediate)
 INVENTORY_RESYNC_INTERVAL_S = 1.0
 RECONNECT_BACKOFF_S = 2.0
