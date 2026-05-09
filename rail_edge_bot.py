@@ -57,6 +57,18 @@ class RailConfig:
     high_ask_price: int
     close_bid_min: int
     close_ask_max: int
+    # ---- v2 knobs (defaults preserve old behavior on unspecified configs) ----
+    # Hard cap per individual rail ticket. Smaller = capacity can't be blown
+    # in a single fill; rail re-posts after each fill via the regular planner.
+    lot_size: int = 200
+    # Allow the ask rail to short up to MAX_SHORT even when not currently long.
+    # This is the symmetric upside-spike edge; without it the high rail only
+    # acts as an *exit* for accumulated longs, which costs ~half the PnL.
+    allow_short_rail: bool = True
+    # If we have been holding inventory for longer than this, flatten with a
+    # market order. The rail edge was already locked in at the rail-fill price;
+    # this just frees capital for the next cycle.
+    force_close_after_ms: int = 5_000
 
     @property
     def instrument(self) -> str:
@@ -92,6 +104,8 @@ class ExchangeState:
     positions: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     live_orders: dict[int, LiveOrder] = field(default_factory=dict)
     inflight_orders: dict[str, PendingOrder] = field(default_factory=dict)
+    # last time (server ms) at which `position(instrument)` crossed back to 0
+    last_flat_ms: dict[str, int] = field(default_factory=dict)
 
     def position(self, instrument: str) -> int:
         return int(self.positions.get(instrument, 0))
@@ -181,17 +195,21 @@ class ExchangeState:
 
 
 def default_rail_configs() -> dict[str, RailConfig]:
+    # close thresholds intentionally near the natural mid (~$100). The rail
+    # already locked in $20+/share of edge at the rail-fill price; the close
+    # only needs to *fire reliably* to recycle inventory. The force-close
+    # path (5s default) is the safety net behind these.
     return {
-        "NASDAQ": RailConfig("NASDAQ", "CARD", 7001, 11000, 10100, 10050),
-        "ZSE": RailConfig("ZSE", "CARD", 7001, 11000, 10500, 10050),
-        "SSE": RailConfig("SSE", "CARD", 7001, 10500, 10500, 10050),
-        "LSE": RailConfig("LSE", "CARD", 7001, 11000, 10500, 10050),
-        "JPX": RailConfig("JPX", "CARD", 7001, 10500, 10500, 10050),
-        "NSE": RailConfig("NSE", "SIMP", 7001, 12999, 10000, 10050),
-        "HKEX": RailConfig("HKEX", "SIMP", 7001, 12900, 10000, 10050),
-        "NYSE": RailConfig("NYSE", "CARD", 7001, 11000, 10500, 10050),
-        "TMX": RailConfig("TMX", "CARD", 7001, 10500, 10500, 10050),
-        "Euronext": RailConfig("Euronext", "SIMP", 7001, 12999, 10000, 10050),
+        "NASDAQ":   RailConfig("NASDAQ",   "CARD", 7001, 11000, 9900, 10100),
+        "ZSE":      RailConfig("ZSE",      "CARD", 7001, 11000, 9900, 10100),
+        "SSE":      RailConfig("SSE",      "CARD", 7001, 10500, 9900, 10100),
+        "LSE":      RailConfig("LSE",      "CARD", 7001, 11000, 9900, 10100),
+        "JPX":      RailConfig("JPX",      "CARD", 7001, 10500, 9900, 10100),
+        "NSE":      RailConfig("NSE",      "SIMP", 7001, 12999, 9900, 10100),
+        "HKEX":     RailConfig("HKEX",     "SIMP", 7001, 12900, 9900, 10100),
+        "NYSE":     RailConfig("NYSE",     "CARD", 7001, 11000, 9900, 10100),
+        "TMX":      RailConfig("TMX",      "CARD", 7001, 10500, 9900, 10100),
+        "Euronext": RailConfig("Euronext", "SIMP", 7001, 12999, 9900, 10100),
     }
 
 
@@ -246,18 +264,34 @@ class RailEdgeStrategy:
         depth: dict[str, dict[str, int]] | None,
         now_ms: int,
     ) -> list[dict[str, Any]]:
-        del now_ms
         instrument = self.config.instrument
         orders: list[dict[str, Any]] = []
 
+        # 1. Force-flatten if inventory has been held past the timeout.
+        #    The rail edge is already realized at the rail-fill price; this is
+        #    a capital-recycling primitive, not a PnL-seeking one.
+        force_close = self._plan_force_close(state, now_ms)
+        if force_close is not None:
+            orders.append(force_close)
+
+        # 2. Polite IOC close at the configured "fair" thresholds.
         close_order = self._plan_close_order(state, depth)
         ask_reserved_this_tick = 0
+        bid_reserved_this_tick = 0
         if close_order is not None:
             orders.append(close_order)
             if close_order["side"] == "ask":
                 ask_reserved_this_tick = int(close_order["quantity"])
+            else:
+                bid_reserved_this_tick = int(close_order["quantity"])
+        if force_close is not None:
+            if force_close["side"] == "ask":
+                ask_reserved_this_tick += int(force_close["quantity"])
+            else:
+                bid_reserved_this_tick += int(force_close["quantity"])
 
-        bid_qty = self._rail_bid_quantity(state)
+        # 3. Re-arm rails (limit orders, capped per ticket).
+        bid_qty = self._rail_bid_quantity(state, bid_reserved_this_tick)
         if bid_qty > 0:
             orders.append(
                 self._order(
@@ -284,6 +318,44 @@ class RailEdgeStrategy:
             )
 
         return orders
+
+    def _plan_force_close(
+        self, state: ExchangeState, now_ms: int
+    ) -> dict[str, Any] | None:
+        """If we have been holding inventory past `force_close_after_ms`,
+        flatten with a market order. Captures whatever liquidity is there,
+        guarantees we recycle capital."""
+        instrument = self.config.instrument
+        pos = state.position(instrument)
+        if pos == 0:
+            state.last_flat_ms[instrument] = int(now_ms)
+            return None
+        last_flat = state.last_flat_ms.get(instrument)
+        if last_flat is None:
+            # first non-zero observation — anchor the timer here so the polite
+            # IOC close path gets a chance before we fall back to market.
+            state.last_flat_ms[instrument] = int(now_ms)
+            return None
+        if int(now_ms) - last_flat < int(self.config.force_close_after_ms):
+            return None
+        # past timeout — flatten, market style.
+        if pos > 0:
+            return self._order(
+                instrument=instrument,
+                side="ask",
+                price=0,                # ignored for market
+                quantity=pos,
+                order_type="market",
+                role="force_close",
+            )
+        return self._order(
+            instrument=instrument,
+            side="bid",
+            price=0,
+            quantity=-pos,
+            order_type="market",
+            role="force_close",
+        )
 
     def _plan_close_order(
         self, state: ExchangeState, depth: dict[str, dict[str, int]] | None
@@ -321,21 +393,29 @@ class RailEdgeStrategy:
 
         return None
 
-    def _rail_bid_quantity(self, state: ExchangeState) -> int:
+    def _rail_bid_quantity(self, state: ExchangeState, extra_reserved: int = 0) -> int:
         instrument = self.config.instrument
         position_room = MAX_LONG - state.position(instrument)
         pending_qty = state.pending_qty(
             instrument, side="bid", price=self.config.low_bid_price, role="rail"
-        )
-        cash_room = state.cash - state.pending_bid_value()
+        ) + int(extra_reserved)
+        cash_room = state.cash - state.pending_bid_value() - CASH_FLOOR
         cash_qty = max(0, cash_room // self.config.low_bid_price)
-        return max(0, min(position_room - pending_qty, cash_qty))
+        capacity = max(0, min(position_room - pending_qty, cash_qty))
+        return min(capacity, int(self.config.lot_size))
 
     def _rail_ask_quantity(self, state: ExchangeState, extra_reserved: int = 0) -> int:
         instrument = self.config.instrument
-        owned_qty = max(0, state.position(instrument))
+        pos = state.position(instrument)
+        if self.config.allow_short_rail:
+            # capacity = pos − MAX_SHORT — covers both selling owned shares AND
+            # opening a short up to the −200 floor.
+            capacity = pos - MAX_SHORT
+        else:
+            capacity = max(0, pos)
         pending_qty = state.pending_qty(instrument, side="ask") + int(extra_reserved)
-        return max(0, owned_qty - pending_qty)
+        capacity = max(0, capacity - pending_qty)
+        return min(capacity, int(self.config.lot_size))
 
     @staticmethod
     def _order(
