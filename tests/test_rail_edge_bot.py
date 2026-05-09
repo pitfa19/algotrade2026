@@ -13,47 +13,53 @@ from rail_edge_bot import (
 
 
 class RailEdgeStrategyTests(unittest.TestCase):
-    def test_flat_account_places_capped_bid_and_short_ask(self):
-        config = RailConfig(
-            exchange="NASDAQ",
-            symbol="CARD",
-            low_bid_price=7001,
-            high_ask_price=11000,
-            close_bid_min=10100,
-            close_ask_max=10050,
-        )
+    def test_flat_account_places_only_cash_backed_bid_at_lot_size(self):
+        # Default config has allow_short_rail=False — server rejects resting
+        # asks beyond owned shares with "Insufficient inventory".
+        config = default_rail_configs()["NASDAQ"]
         state = ExchangeState(exchange="NASDAQ")
         strategy = RailEdgeStrategy(config)
 
         orders = strategy.plan_orders(state, depth=None, now_ms=1_000)
         bids = [o for o in orders if o["side"] == "bid"]
         asks = [o for o in orders if o["side"] == "ask"]
-
-        # bid capped at lot_size=200
         self.assertEqual(len(bids), 1)
-        self.assertEqual((bids[0]["price"], bids[0]["quantity"], bids[0]["order_type"]),
-                         (7001, 200, "limit"))
-        # ask exists even at flat position because allow_short_rail is on,
-        # capped at SOFT_MAX_SHORT=-180 (so 180 shares of short capacity)
-        from rail_edge_bot import SOFT_MAX_SHORT
-        self.assertEqual(len(asks), 1)
-        self.assertEqual((asks[0]["price"], asks[0]["quantity"], asks[0]["order_type"]),
-                         (11000, -SOFT_MAX_SHORT, "limit"))
+        self.assertEqual((bids[0]["price"], bids[0]["quantity"]),
+                         (config.low_bid_price, config.lot_size))
+        self.assertEqual(asks, [])
 
-    def test_flat_account_with_short_rail_disabled_places_no_ask(self):
+    def test_with_short_rail_explicitly_enabled_an_ask_is_planned(self):
+        config = default_rail_configs()["NASDAQ"]
+        # toggle the (off-by-default) experimental short-rail
         config = RailConfig(
-            exchange="NASDAQ",
-            symbol="CARD",
-            low_bid_price=7001,
-            high_ask_price=11000,
-            close_bid_min=10100,
-            close_ask_max=10050,
-            allow_short_rail=False,
+            exchange=config.exchange, symbol=config.symbol,
+            low_bid_price=config.low_bid_price, high_ask_price=config.high_ask_price,
+            close_bid_min=config.close_bid_min, close_ask_max=config.close_ask_max,
+            lot_size=config.lot_size, allow_short_rail=True,
+            force_close_after_ms=config.force_close_after_ms,
         )
         state = ExchangeState(exchange="NASDAQ")
         strategy = RailEdgeStrategy(config)
         orders = strategy.plan_orders(state, depth=None, now_ms=1_000)
-        self.assertEqual([o for o in orders if o["side"] == "ask"], [])
+        asks = [o for o in orders if o["side"] == "ask"]
+        self.assertEqual(len(asks), 1)
+        self.assertEqual(asks[0]["price"], config.high_ask_price)
+
+    def test_bid_does_not_stack_above_lot_size(self):
+        # The previous-tick bid (still inflight or resting) must NOT trigger
+        # a duplicate bid. lot_size is a target, not a per-tick add.
+        config = default_rail_configs()["NASDAQ"]
+        state = ExchangeState(exchange="NASDAQ")
+        state.track_order(
+            local_id="resting", order_id=1,
+            instrument="NASDAQ-CARD", side="bid",
+            price=config.low_bid_price, quantity=config.lot_size,
+            role="rail",
+        )
+        strategy = RailEdgeStrategy(config)
+        orders = strategy.plan_orders(state, depth=None, now_ms=2_000)
+        bids = [o for o in orders if o["side"] == "bid"]
+        self.assertEqual(bids, [])
 
     def test_long_inventory_places_high_rail_ask_capped_at_lot_size(self):
         config = default_rail_configs()["NASDAQ"]
@@ -129,12 +135,10 @@ class RailEdgeStrategyTests(unittest.TestCase):
                 if int(p) >= config.close_bid_min),
         )
         self.assertEqual(close_orders[0]["quantity"], expected_close_qty)
-        # close consumes 620 of the 800-share short capacity (pos − SOFT_MAX_SHORT),
-        # leaving 180 for the limit-rail ask, capped further by lot_size.
-        # Confirms the close reservation flows into the rail sizing.
-        from rail_edge_bot import SOFT_MAX_SHORT
-        expected = min(config.lot_size, (620 - SOFT_MAX_SHORT) - 620)
-        self.assertEqual(sum(order["quantity"] for order in limit_asks), expected)
+        # With allow_short_rail=False (default — server rejects resting
+        # shorts), the close reserves 620 against the 620 owned shares;
+        # that leaves zero owned capacity for an additional rail ask.
+        self.assertEqual(sum(order["quantity"] for order in limit_asks), 0)
 
     def test_short_position_closes_only_against_visible_asks_below_threshold(self):
         config = default_rail_configs()["NASDAQ"]

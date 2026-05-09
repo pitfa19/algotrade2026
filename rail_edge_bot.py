@@ -64,10 +64,13 @@ class RailConfig:
     # Hard cap per individual rail ticket. Smaller = capacity can't be blown
     # in a single fill; rail re-posts after each fill via the regular planner.
     lot_size: int = 200
-    # Allow the ask rail to short up to MAX_SHORT even when not currently long.
-    # This is the symmetric upside-spike edge; without it the high rail only
-    # acts as an *exit* for accumulated longs, which costs ~half the PnL.
-    allow_short_rail: bool = True
+    # Whether the high rail may short via a *resting* limit ask. Many
+    # matching engines (this one included, per server "Insufficient
+    # inventory" rejections) only accept resting asks against owned shares.
+    # Default off — the symmetric upside catch must come via a crossing
+    # IOC instead, which `_plan_close_order` already does for short
+    # inventory we accumulate from real fills.
+    allow_short_rail: bool = False
     # If we have been holding inventory for longer than this, flatten with a
     # market order. The rail edge was already locked in at the rail-fill price;
     # this just frees capital for the next cycle.
@@ -400,34 +403,42 @@ class RailEdgeStrategy:
         return None
 
     def _rail_bid_quantity(self, state: ExchangeState, extra_reserved: int = 0) -> int:
+        """Top up the resting rail bid to `lot_size` shares total.
+
+        Crucially, lot_size is a TARGET (how much we want resting at the
+        rail price), not a per-tick add. Without this distinction the bot
+        re-issued lot_size shares every tick, stacking reservations until
+        the exchange rejected with "Insufficient balance".
+        """
         instrument = self.config.instrument
-        # Soft cap on position: hard floor is +2000 long, but we stop at
-        # SOFT_MAX_LONG=1800 so an in-flight burst can't push us across.
-        position_room = SOFT_MAX_LONG - state.position(instrument)
         pending_qty = state.pending_qty(
             instrument, side="bid", price=self.config.low_bid_price, role="rail"
         ) + int(extra_reserved)
-        # Track *our own* reservations (resting + inflight bids) and check
-        # against the SOFT cash floor (-$45k) — leaves a $5k cushion above
-        # the exchange's hard −$50k floor. This is the namikv2 trick: never
-        # plan to a hard limit, always to a soft one.
+        # how many more we can add WITHOUT busting the resting target
+        target_room = max(0, int(self.config.lot_size) - pending_qty)
+        # how many more we can add without busting the soft position cap
+        position_room = max(0, SOFT_MAX_LONG - state.position(instrument) - pending_qty)
+        # how many more we can afford while staying above the SOFT cash floor
         cash_room = state.cash - state.pending_bid_value() - SOFT_CASH_FLOOR
         cash_qty = max(0, cash_room // self.config.low_bid_price)
-        capacity = max(0, min(position_room - pending_qty, cash_qty))
-        return min(capacity, int(self.config.lot_size))
+        return max(0, min(target_room, position_room, cash_qty))
 
     def _rail_ask_quantity(self, state: ExchangeState, extra_reserved: int = 0) -> int:
+        """Top up the resting rail ask to `lot_size` shares — but only
+        against shares we actually own. The exchange rejects resting asks
+        beyond the held position with "Insufficient inventory"."""
         instrument = self.config.instrument
         pos = state.position(instrument)
         if self.config.allow_short_rail:
-            # capacity = pos − SOFT_MAX_SHORT — covers selling owned shares AND
-            # opening a short down to the soft −180 floor (vs hard −200).
-            capacity = pos - SOFT_MAX_SHORT
+            # Optimistic: try to short down to the soft floor. Only safe if
+            # the venue accepts resting asks against future short positions.
+            owned = pos - SOFT_MAX_SHORT
         else:
-            capacity = max(0, pos)
+            owned = max(0, pos)
         pending_qty = state.pending_qty(instrument, side="ask") + int(extra_reserved)
-        capacity = max(0, capacity - pending_qty)
-        return min(capacity, int(self.config.lot_size))
+        target_room = max(0, int(self.config.lot_size) - pending_qty)
+        capacity   = max(0, owned - pending_qty)
+        return max(0, min(target_room, capacity))
 
     @staticmethod
     def _order(
