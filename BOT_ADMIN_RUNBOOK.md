@@ -66,6 +66,11 @@ Avoid running these together:
 - `parallax.py` and any other active trading bot: `parallax.py` is the broadest in the repo.
 - `parallax.py` and `prism.py`: maximum overlap; both fire ETF/basket/sub-ETF/xv arbs.
 - `parallax.py` and `apex_bot.py`: both fire ETF basket arb and cross-venue arb.
+- `parallax.py` and `god_bot.py`: same edge surface (ETF/basket, cross-venue, safe-haven).
+- `god_bot.py` and any other active trading bot: `god_bot.py` spans ETF basket
+  arb, cross-venue lead/lag, CARD/SIMP anomaly detection, safe-haven rotation,
+  and end-of-segment flattening. Run it alone unless you are deliberately
+  partitioning exchanges and risk budgets.
 - `apex_bot.py` and any of `fabijan_v1/v2/v3.py`, `edge_trader_bot.py`, `codex_bot.py`,
   `codex_bot_v2.py`, `namikv1.py`, `alpha_bot.py`, `prism.py`: `apex_bot.py` covers
   ETF basket arb, cross-venue arb, MM-skew, and EOS unwind — running it next to
@@ -91,6 +96,13 @@ For analyzer-driven route trading, use:
 ```bash
 tmux new -s edge
 LIVE_TRADING=1 EXCHANGES=HKEX,NASDAQ,ZSE,NYSE,SSE,JPX,NSE EDGE_QTY=5 MAX_MSGS_PER_SEC=250 python3 edge_trader_bot.py
+```
+
+For the new dry-run-gated multi-strategy bot, use:
+
+```bash
+tmux new -s god
+LIVE_TRADING=1 GOD_LOCATION=ZSE GOD_VENUES=ZSE,NYSE,NASDAQ,EURONEXT,LSE,HKEX,TMX GOD_MAX_MSGS_PER_SEC=120 GOD_MAX_ORDER_QTY=8 GOD_MAX_SYMBOL_ABS_POS=80 GOD_ARB_UNIT_SIZE=1 GOD_ORDERS_PER_EVAL=16 GOD_ENABLE_PASSIVE_MICRO=0 python3 god_bot.py
 ```
 
 For maximum alpha but highest operational risk, use:
@@ -127,6 +139,7 @@ Scores are operator scores from 1-10, not guaranteed PnL.
 | `prism.py` | Yes | Multi-venue ETF/basket/sub-ETF/stock arb + passive MM | 4 | 9 | 10 | 6 | 7 | Highest ambition, highest blast radius |
 | `parallax.py` | Yes | prism edges + consensus FV, vol-adaptive thresholds, stat FV snipe, sector residual ETF-hedged, SH coherence, inv+flow-skewed MM | 4 | 10 | 10 | 5 | 8 | Broadest bot in the repo; highest expected edge but highest blast radius |
 | `apex_bot.py` | Yes | Rule-based ETF basket arb + ZSE oracle cross-venue + MM-skew + EOS unwind | 7 | 8 | 6 | 7 | 8 | New flagship, deterministic ETF edge, untested live |
+| `god_bot.py` | Yes | Dry-run-gated ETF/basket, lead-lag, anomaly, safe-haven, flattening | 8 | 8 | 7 | 7 | 8 | New safest broad bot; first live with conservative caps |
 | `history_bot.py` | No | Data capture | 10 | N/A | 2 | 9 | 9 | Always useful in tests |
 | `analyzerbot.py` | No | Offline analysis and scoring | 10 | N/A | 2 | 9 | 9 | Run after captures |
 | `dashboard.py` | No | Monitoring UI | 8 | N/A | 4 | 7 | 7 | Useful if connection budget permits |
@@ -811,6 +824,107 @@ Operator notes:
 Admin score: 8/10. Strongest theoretical edge in the repo (rule-based ETF
 mean reversion), but never run live. Watch the first segment closely.
 
+### `god_bot.py`
+
+Purpose: standalone competition bot with a shared risk gate and independent
+strategy modules:
+
+- ETF fair-value dislocations versus executable equal-weight baskets.
+- Cross-venue price leadership and stale-quote taking using the current
+  `GOD_LOCATION` latency profile.
+- Microprice/order-book imbalance signals, disabled by default for safety.
+- Safe-haven lag/fade behavior for `GOLD`, `XAG`, and `ETFSH`.
+- CARD/SIMP median/MAD anomaly detection without relying on hidden rules.
+- End-of-segment inventory flattening, with market-order panic flattening only
+  in the final window.
+
+Dry run, no orders sent:
+
+```bash
+python3 god_bot.py
+```
+
+Print resolved config without connecting:
+
+```bash
+python3 god_bot.py --print-config --no-connect
+```
+
+Conservative first live run:
+
+```bash
+tmux new -s god
+LIVE_TRADING=1 \
+GOD_LOCATION=ZSE \
+GOD_VENUES=ZSE,NYSE,NASDAQ,EURONEXT,LSE,HKEX,TMX \
+GOD_MAX_MSGS_PER_SEC=120 \
+GOD_MAX_ORDER_QTY=8 \
+GOD_MAX_SYMBOL_ABS_POS=80 \
+GOD_ARB_UNIT_SIZE=1 \
+GOD_ORDERS_PER_EVAL=16 \
+GOD_ENABLE_PASSIVE_MICRO=0 \
+python3 god_bot.py
+```
+
+Aggressive live run:
+
+```bash
+tmux new -s god-aggr
+LIVE_TRADING=1 \
+GOD_LOCATION=HKEX \
+GOD_VENUES=NYSE,NASDAQ,SSE,JPX,EURONEXT,LSE,HKEX,NSE,TMX,ZSE \
+GOD_MAX_MSGS_PER_SEC=400 \
+GOD_MAX_ORDER_QTY=80 \
+GOD_MAX_SYMBOL_ABS_POS=450 \
+GOD_MIN_CASH_CENTS=-4500000 \
+GOD_ARB_UNIT_SIZE=8 \
+GOD_CROSS_UNIT_SIZE=20 \
+GOD_ANOMALY_UNIT_SIZE=20 \
+GOD_SAFE_UNIT_SIZE=12 \
+GOD_ORDERS_PER_EVAL=80 \
+GOD_ENABLE_PASSIVE_MICRO=1 \
+python3 god_bot.py
+```
+
+Flags:
+
+| Env/Flag | Default | Meaning |
+|---|---:|---|
+| `LIVE_TRADING` / `--live` | false | Required before real orders are sent |
+| `--dry-run` | false | Force observe-only mode even if `LIVE_TRADING=1` |
+| `GOD_LOCATION` / `--location` | `ZSE` | Current latency profile: `NYSE`, `ZSE`, or `HKEX` |
+| `GOD_VENUES` / `--venues` | `ZSE,NYSE,NASDAQ,EURONEXT,LSE,HKEX,TMX` | Connected exchanges |
+| `GOD_HOST_OVERRIDES` | none | Comma-separated `EXCHANGE=host` overrides |
+| `GOD_MAX_MSGS_PER_SEC` | `120` | Per-exchange local send cap; server hard limit is 500 |
+| `GOD_ORDERS_PER_EVAL` | `16` | Total submitted order legs per strategy evaluation |
+| `GOD_MAX_ORDER_QTY` | `8` | Max shares per single order |
+| `GOD_MAX_SYMBOL_ABS_POS` | `80` | Soft absolute position cap per instrument/exchange |
+| `GOD_MIN_CASH_CENTS` | `-2000000` | Soft per-exchange cash floor |
+| `GOD_ARB_UNIT_SIZE` | `1` | Basket-arb unit size |
+| `GOD_CROSS_UNIT_SIZE` | `3` | Cross-venue lead/lag order size |
+| `GOD_ANOMALY_UNIT_SIZE` | `3` | CARD/SIMP anomaly order size |
+| `GOD_SAFE_UNIT_SIZE` | `2` | Safe-haven rotation order size |
+| `GOD_ENABLE_PASSIVE_MICRO` | false | Enable short-expiry passive microprice orders |
+| `GOD_FLATTEN_WINDOW_MS` | `75000` | Stop opening and start reducing inventory |
+| `GOD_PANIC_FLATTEN_MS` | `20000` | Use market orders for urgent flattening |
+| `LOG_LEVEL` / `GOD_LOG_LEVEL` | `INFO` | Structured JSON logging verbosity |
+
+Operator notes:
+
+- `LIVE_TRADING=1` is required for live orders. Dry-run logs every would-be
+  order as `dry_order`.
+- Update `GOD_LOCATION` at each 10-minute segment rotation. Wrong location
+  makes the lead/lag routing overconfident.
+- Keep `GOD_ENABLE_PASSIVE_MICRO=0` for first live runs. Passive quoting adds
+  fill uncertainty and pending-order pressure.
+- Run alone for scoring attempts. It already consumes the broad ETF,
+  cross-venue, CARD/SIMP, safe-haven, and flattening risk budgets.
+- INFO logs are JSON lines with `opportunity`, `order_submit`, `order_ack`,
+  `order_reject`, `inventory_snapshot`, reconnect, and segment-reset events.
+
+Admin score: 8/10. Best new broad bot for a controlled first live attempt
+because it is dry-run-gated and conservative by default.
+
 ### `dashboard.py`
 
 Purpose: local monitoring dashboard, not a trading bot.
@@ -967,6 +1081,7 @@ Use this during a round:
 | You want maximum ambition and accept risk | `prism.py --venues ...` |
 | You want broader-than-prism alpha with consensus FV, stat snipes, and inventory-skewed MM | `parallax.py --venues ...` |
 | You want the deterministic ETF edge with auto co-location | `apex_bot.py` (dry-run first) |
+| You want the new broad bot with dry-run gate and strict risk checks | `god_bot.py` conservative command |
 | You are in a testing round | `history_bot.py` + `analyzerbot.py` |
 | Official dashboard is poor | `dashboard.py` |
 | You need a C++ starting point | `demo_bot.cpp`; use `bot.cpp` only after a small-venue build check |
@@ -1003,6 +1118,7 @@ Manual score sheet:
 | `alpha_bot.py` |  |  |  |  |  |  |  |
 | `prism.py` |  |  |  |  |  |  |  |
 | `apex_bot.py` |  |  |  |  |  |  |  |
+| `god_bot.py` |  |  |  |  |  |  |  |
 
 ## 8. Shutdown
 
@@ -1036,7 +1152,7 @@ tmux kill-session -t bot
 The safest profitable path is:
 
 ```text
-history_bot.py -> analyzerbot.py -> fabijan_v1.py or edge_trader_bot.py
+history_bot.py -> analyzerbot.py -> fabijan_v1.py, edge_trader_bot.py, or god_bot.py
 ```
 
 Use broad bots only after they show clean dry-run output and stable behavior in
