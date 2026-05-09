@@ -57,6 +57,7 @@
 #include <boost/asio/strand.hpp>
 
 #include <nlohmann/json.hpp>
+#include <unordered_set>
 
 namespace beast     = boost::beast;
 namespace websocket = beast::websocket;
@@ -825,6 +826,54 @@ private:
     std::mutex conn_mtx_;       // protects connections_ map
     std::atomic<bool> running_{false};
 };
+
+
+inline void SimpleStrategy::on_market_data(Bot& bot,
+                                           const std::string& exchange,
+                                           const MarketState& state) {
+    auto nyse_instruments = state.instruments_on("NYSE");
+    auto exec_instruments = state.instruments_on(exchange);
+
+    if (nyse_instruments.empty() || exec_instruments.empty())
+        return;
+
+    std::unordered_set<std::string> nyse_set(
+        nyse_instruments.begin(),
+        nyse_instruments.end()
+    );
+
+    for (const auto& symbol : exec_instruments) {
+        if (!nyse_set.count(symbol))
+            continue;
+
+        auto nyse = state.get_book("NYSE", symbol);
+        auto exec_book = state.get_book(exchange, symbol);
+
+        if (!nyse || !exec_book)
+            continue;
+
+        auto n_bid = nyse->best_bid();
+        auto n_ask = nyse->best_ask();
+        auto e_bid = exec_book->best_bid();
+        auto e_ask = exec_book->best_ask();
+
+        if (!n_bid || !n_ask || !e_bid || !e_ask)
+            continue;
+
+        double nyse_mid = (*n_bid + *n_ask) * 0.5;
+        double exec_mid = (*e_bid + *e_ask) * 0.5;
+        double diff = nyse_mid - exec_mid;
+
+        const double threshold = 0.05;
+
+        if (diff > threshold) {
+            bot.place_order(exchange, symbol, "buy", *e_ask, 100);
+        }
+        if (diff < -threshold) {
+            bot.place_order(exchange, symbol, "sell", *e_bid, 100);
+        }
+    }
+}
 
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
