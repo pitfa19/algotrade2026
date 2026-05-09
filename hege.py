@@ -343,6 +343,7 @@ class Config:
     inventory_poll_ms: int = 1_000
     pending_poll_ms: int = 5_000
     connect_timeout_ms: int = 2_000
+    diagnostics_interval_ms: int = 2_000
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "Config":
@@ -404,6 +405,7 @@ class Config:
             inventory_poll_ms=env_int(env, "INVENTORY_POLL_MS", 1000),
             pending_poll_ms=env_int(env, "PENDING_POLL_MS", 5000),
             connect_timeout_ms=env_int(env, "CONNECT_TIMEOUT_MS", 2000),
+            diagnostics_interval_ms=env_int(env, "DIAGNOSTICS_INTERVAL_MS", 2000),
         )
 
     @property
@@ -1484,6 +1486,7 @@ class StrategyEngine:
         self.clients: dict[str, ExchangeClient] = {}
         self.lock = asyncio.Lock()
         self.last_run_ms = 0
+        self.last_diag_ms = 0
         self.last_signal_ms: dict[tuple[str, str, str, str], int] = defaultdict(int)
 
     def set_clients(self, clients: Mapping[str, "ExchangeClient"]) -> None:
@@ -1502,29 +1505,51 @@ class StrategyEngine:
 
     async def _run_once(self) -> None:
         signals: list[Signal] = []
+        strategy_counts: dict[str, int] = {}
         if self._should_flatten():
             signals.extend(self.flattener.generate(self.state, self.risk, self.cfg))
+            strategy_counts[self.flattener.name] = len(signals)
         else:
             for strategy in self.strategies:
-                with contextlib.suppress(Exception):
+                try:
+                    before = len(signals)
                     signals.extend(strategy.generate(self.state, self.risk, self.cfg))
+                    strategy_counts[strategy.name] = len(signals) - before
+                except Exception as exc:
+                    strategy_counts[strategy.name] = -1
+                    log_event(
+                        self.logger,
+                        logging.WARNING,
+                        "strategy_exception",
+                        strategy=strategy.name,
+                        error=repr(exc),
+                    )
+            before = len(signals)
             signals.extend(self._risk_compression_signals())
+            strategy_counts["risk_compression"] = len(signals) - before
         if not signals:
+            self._maybe_log_diagnostics("no_signals", strategy_counts, {})
             return
         signals.sort(key=lambda sig: score_signal(sig, self.cfg), reverse=True)
         sent_total = 0
         sent_by_exchange: dict[str, int] = defaultdict(int)
+        skip_counts: dict[str, int] = defaultdict(int)
         for sig in signals:
             if sent_total >= self.cfg.max_orders_per_tick:
+                skip_counts["max_orders_per_tick"] += 1
                 break
             if sent_by_exchange[sig.exchange] >= self.cfg.max_orders_per_exchange_tick:
+                skip_counts["max_orders_per_exchange_tick"] += 1
                 continue
             if not sig.reduce_only and self.state.time_remaining_ms(sig.exchange) <= self.cfg.no_open_last_ms:
+                skip_counts["no_open_last_ms"] += 1
                 continue
             if not self._cooldown_ok(sig):
+                skip_counts["cooldown"] += 1
                 continue
             decision = self.risk.approve(sig.exchange, sig.instrument_id, sig.side, sig.price, sig.quantity, sig.reduce_only)
             if not decision.ok:
+                skip_counts[f"risk_{decision.reason}"] += 1
                 log_event(
                     self.logger,
                     logging.DEBUG,
@@ -1540,11 +1565,20 @@ class StrategyEngine:
                 continue
             client = self.clients.get(sig.exchange)
             if not client:
+                skip_counts["no_client"] += 1
                 continue
             self.last_signal_ms[(sig.strategy, sig.exchange, sig.instrument_id, sig.side)] = now_mono_ms()
             await client.submit_order(sig)
             sent_total += 1
             sent_by_exchange[sig.exchange] += 1
+        self._maybe_log_diagnostics(
+            "orders_sent" if sent_total else "signals_blocked",
+            strategy_counts,
+            skip_counts,
+            total_signals=len(signals),
+            sent_total=sent_total,
+            sent_by_exchange=dict(sent_by_exchange),
+        )
 
     def _should_flatten(self) -> bool:
         return any(self.state.time_remaining_ms(exchange) <= self.cfg.flatten_last_ms for exchange in self.cfg.venues)
@@ -1554,6 +1588,45 @@ class StrategyEngine:
             return True
         key = (sig.strategy, sig.exchange, sig.instrument_id, sig.side)
         return now_mono_ms() - self.last_signal_ms[key] >= self.cfg.signal_cooldown_ms
+
+    def _maybe_log_diagnostics(
+        self,
+        event: str,
+        strategy_counts: Mapping[str, int],
+        skip_counts: Mapping[str, int],
+        **extra: Any,
+    ) -> None:
+        now_ms = now_mono_ms()
+        if now_ms - self.last_diag_ms < self.cfg.diagnostics_interval_ms:
+            return
+        self.last_diag_ms = now_ms
+        total_books = 0
+        fresh_books = 0
+        exchange_books: dict[str, int] = {}
+        for exchange in self.cfg.venues:
+            books = self.state.books.get(exchange, {})
+            exchange_books[exchange] = len(books)
+            total_books += len(books)
+            fresh_books += sum(1 for book in books.values() if book.complete and book.age_ms() <= self.cfg.stale_book_ms)
+        remaining = {
+            exchange: self.state.time_remaining_ms(exchange)
+            for exchange in self.cfg.venues
+            if exchange in self.state.server_time_ms
+        }
+        log_event(
+            self.logger,
+            logging.INFO,
+            event,
+            live_trading=self.cfg.live_trading,
+            dry_run=self.cfg.dry_run,
+            total_books=total_books,
+            fresh_books=fresh_books,
+            exchange_books=exchange_books,
+            strategy_counts=dict(strategy_counts),
+            skip_counts=dict(skip_counts),
+            time_remaining_ms=remaining,
+            **extra,
+        )
 
     def _risk_compression_signals(self) -> list[Signal]:
         out: list[Signal] = []
