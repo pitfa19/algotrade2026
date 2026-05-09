@@ -40,8 +40,9 @@ These are the non-obvious rules that shape architecture decisions:
 
 - **Team VM:** `ssh root@vm.algotrade.hr` (password `algotrade`), 4 vCPU, 6 GB. Linux. Bot runs here in production.
 - **Exchanges:** `ws://<exchange>.algotrade.hr:9001/trade` — the 10 hostnames are `nyse`, `nasdaq`, `sse`, `jpx`, `euronext`, `lse`, `hkex`, `nse`, `tmx`, `zse`. Health check: `GET /health` on the same port returns `{status, time, round_length}`.
-- **Dashboard:** `http://dashboard.algotrade.hr` for manual book inspection / debugging. Not required for the bot.
-- **Venue network only.** None of the above resolves outside the event venue.
+- **Dashboard:** `http://dashboard.algotrade.hr` (10.0.112.3) for manual book inspection / debugging. Not required for the bot. Only serves HTTP while a round is live — outside rounds DNS still resolves and a route exists, but every common TCP port (80/443/8080/9001/3000/5000) is closed/filtered. Don't treat unreachability as a config bug.
+- **Exchange WS endpoints behave the same:** `ws://...:9001/trade` and the `/health` endpoint also only respond during active rounds. Probing them between rounds will time out.
+- **Venue network only.** None of the above resolves outside the event venue. This workstation is on the venue subnet (`10.1.112.0/24`); `docs.algotrade.hr` (10.1.10.20) is reachable from here at all times — the docs are the only venue host that stays up between rounds.
 
 ## Conventions for this repo
 
