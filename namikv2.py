@@ -280,8 +280,9 @@ class BotConfig:
 
     # Hedge legs
     hedge_enabled: bool = True
-    hedge_min_latency_ms: int = 50
+    hedge_min_latency_ms: int = 50      # only enforced for latency_arb (lead-lag needs distance)
     hedge_size_ratio: float = 1.0
+    active_arb_hedge_enabled: bool = True  # always hedge active_arb when leader is available
 
     # Adaptive thresholds
     adaptive_threshold_enabled: bool = True
@@ -731,7 +732,7 @@ class StrategyEngine:
         opps.sort(key=lambda o: o.score, reverse=True)
         return opps
 
-    # ---- active arb ----
+    # ---- active arb (cross-exchange spread, hedged) ----
     def _active_arb(
         self, snapshot: BookSnapshot, ticker: str, fv: float,
         state: MarketState, risk: Optional["RiskManager"],
@@ -748,19 +749,25 @@ class StrategyEngine:
         if book.best_ask is not None:
             edge = fv - book.best_ask
             if edge >= buy_threshold:
-                out.append(self._build_opp(
+                opp = self._build_opp(
                     snapshot, Side.BID, book.best_ask, book.best_ask_qty,
                     "ioc", f"ARB buy {ticker}: ask {book.best_ask} < FV {fv:.1f}",
                     edge, threshold, source="active_arb",
-                ))
+                )
+                if self.config.active_arb_hedge_enabled:
+                    opp.hedge = self._build_hedge(opp, ticker, state, require_latency=False)
+                out.append(opp)
         if book.best_bid is not None:
             edge = book.best_bid - fv
             if edge >= sell_threshold:
-                out.append(self._build_opp(
+                opp = self._build_opp(
                     snapshot, Side.ASK, book.best_bid, book.best_bid_qty,
                     "ioc", f"ARB sell {ticker}: bid {book.best_bid} > FV {fv:.1f}",
                     edge, threshold, source="active_arb",
-                ))
+                )
+                if self.config.active_arb_hedge_enabled:
+                    opp.hedge = self._build_hedge(opp, ticker, state, require_latency=False)
+                out.append(opp)
         return out
 
     # ---- latency arb (with hedge) ----
@@ -1113,15 +1120,24 @@ class StrategyEngine:
 
     def _build_hedge(
         self, primary: Opportunity, ticker: str, state: MarketState,
+        require_latency: bool = True,
     ) -> Optional[Opportunity]:
+        """Build an opposite-side hedge order on the best leader exchange.
+
+        If require_latency=True (default for latency/etf_basket arb), the leader must be
+        at least hedge_min_latency_ms RTT away — those strategies depend on lead-lag distance.
+        For active_arb (cross-exchange spread arb), we want to hedge regardless of distance,
+        since the trigger is a *price gap*, not a *staleness gap*.
+        """
         if not self.config.hedge_enabled:
             return None
         leader = state.best_leader_for(ticker, exclude_exchange=primary.exchange)
         if leader is None:
             return None
-        rtt = LATENCY_RTT_MS.get(primary.exchange, {}).get(leader, 0)
-        if rtt < self.config.hedge_min_latency_ms:
-            return None
+        if require_latency:
+            rtt = LATENCY_RTT_MS.get(primary.exchange, {}).get(leader, 0)
+            if rtt < self.config.hedge_min_latency_ms:
+                return None
 
         leader_book = state.book(leader, instrument_id(leader, ticker))
         if leader_book is None:
