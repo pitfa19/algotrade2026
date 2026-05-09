@@ -1,16 +1,16 @@
 """
-AlgoTrade 2026 trading bot.
+AlgoTrade 2026 — ZSE ETF basket arbitrage bot (v2).
 
-Strategy:
-  1. Passive market-making one tick inside the built-in MM, inventory-skewed,
-     across every instrument on every exchange that lists it.
-  2. ETF / basket arbitrage on ZSE (the only venue that lists every ETF and
-     every constituent), fired as IOC orders when the ETF mid deviates from
-     the equal-weighted basket fair beyond a threshold.
+Strategy: a single WebSocket connection to ZSE (the only venue listing every
+stock and every ETF). For each of the 5 ETFs, compare ETF touch against the
+basket's *executable* total — the sum of constituent bids when we'd be selling
+the basket, asks when we'd be buying. When the per-share edge clears
+ARB_THRESHOLD cents, IOC-fire the ETF leg and every constituent leg at the
+touch in parallel. Conservative caps (ETF_POS_CAP, ARB_SIZE). In the last
+30 s of a segment we stop opening and flatten residual inventory at market.
 
 All numerics are integer cents. Local rate limiter stays at 80% of the
-500 msg/s/exchange budget. Reconnect loop survives the per-segment exchange
-restart (every 10 minutes).
+500 msg/s budget. Reconnect loop survives the per-segment exchange restart.
 """
 
 from __future__ import annotations
@@ -38,52 +38,9 @@ log = logging.getLogger("bot")
 # Config
 # ---------------------------------------------------------------------------
 
-EXCHANGE_HOSTS = {
-    "NYSE":     "nyse.algotrade.hr",
-    "NASDAQ":   "nasdaq.algotrade.hr",
-    "SSE":      "sse.algotrade.hr",
-    "JPX":      "jpx.algotrade.hr",
-    "Euronext": "euronext.algotrade.hr",
-    "LSE":      "lse.algotrade.hr",
-    "HKEX":     "hkex.algotrade.hr",
-    "NSE":      "nse.algotrade.hr",
-    "TMX":      "tmx.algotrade.hr",
-    "ZSE":      "zse.algotrade.hr",
-}
+ZSE_HOST = os.environ.get("ZSE_HOST", "zse.algotrade.hr")
 PORT = 9001
-
-# Stock listings: ticker -> set of exchanges (from participant guide §4).
-STOCK_LISTINGS: dict[str, set[str]] = {
-    "CARD": {"NYSE","NASDAQ","LSE","Euronext","JPX","SSE","HKEX","NSE","TMX","ZSE"},
-    "SIMP": {"NYSE","NASDAQ","LSE","Euronext","JPX","SSE","HKEX","NSE","TMX","ZSE"},
-    "NGUP": {"NYSE","NASDAQ","Euronext","TMX","ZSE"},
-    "OIT":  {"LSE","Euronext","HKEX","NSE","ZSE"},
-    "KTST": {"NYSE","JPX","TMX","ZSE"},
-    "FSR":  {"NASDAQ","LSE","SSE","HKEX","ZSE"},
-    "JZRO": {"NYSE","LSE","Euronext","TMX","ZSE"},
-    "XFR":  {"NYSE","HKEX","TMX","ZSE"},
-    "KOTD": {"NASDAQ","LSE","Euronext","HKEX","ZSE"},
-    "INA":  {"NYSE","NASDAQ","Euronext","HKEX","ZSE"},
-    "HT":   {"NASDAQ","LSE","JPX","SSE","TMX","ZSE"},
-    "JNAF": {"NYSE","Euronext","JPX","HKEX","ZSE"},
-    "DLKV": {"NASDAQ","LSE","HKEX","NSE","ZSE"},
-    "DDJH": {"NYSE","LSE","Euronext","TMX","ZSE"},
-    "MDKA": {"NYSE","LSE","HKEX","TMX","ZSE"},
-    "KRAS": {"NYSE","Euronext","SSE","TMX","ZSE"},
-    "ZITO": {"NASDAQ","LSE","Euronext","NSE","ZSE"},
-    "ZABA": {"NYSE","LSE","SSE","NSE","TMX","ZSE"},
-    "GOLD": {"NASDAQ","Euronext","JPX","TMX","ZSE"},
-    "XAG":  {"LSE","Euronext","JPX","ZSE"},
-}
-
-# ETF listings: ticker -> set of exchanges (from participant guide §5).
-ETF_LISTINGS: dict[str, set[str]] = {
-    "ETFA":  {"NYSE","Euronext","HKEX","ZSE"},
-    "ETFB":  {"NASDAQ","LSE","HKEX","ZSE"},
-    "ETFA3": {"NYSE","TMX","ZSE"},
-    "ETFB3": {"NASDAQ","HKEX","ZSE"},
-    "ETFSH": {"Euronext","JPX","ZSE"},
-}
+URL = f"ws://{ZSE_HOST}:{PORT}/trade"
 
 ETF_BASKETS: dict[str, list[str]] = {
     "ETFA":  ["NGUP", "OIT", "KTST", "FSR", "JZRO", "XFR"],
@@ -93,45 +50,29 @@ ETF_BASKETS: dict[str, list[str]] = {
     "ETFSH": ["GOLD", "XAG"],
 }
 
-# Per-exchange list of (ticker, is_etf) we trade.
-def instruments_on(exchange: str) -> list[tuple[str, bool]]:
-    out: list[tuple[str, bool]] = []
-    for t, exs in STOCK_LISTINGS.items():
-        if exchange in exs:
-            out.append((t, False))
-    for t, exs in ETF_LISTINGS.items():
-        if exchange in exs:
-            out.append((t, True))
-    return out
+# Server-enforced limits (for reference; we stay well inside).
+SERVER_RATE_LIMIT = 500          # msg/s — exceed = connection closed
+SERVER_POS_FLOOR = -200          # per instrument
+SERVER_POS_CEIL = 2000           # per instrument
+SERVER_CASH_FLOOR = -5_000_000   # cents
 
-# --- Limits (server enforced) ---
-SERVER_RATE_LIMIT = 500           # msg/s/exchange — exceed = connection closed
-LOCAL_RATE_LIMIT = 400            # 80% safety margin
-SERVER_POS_FLOOR = -200
-SERVER_POS_CEIL = 2000
-SERVER_CASH_FLOOR = -5_000_000    # cents
-
-# --- Strategy params ---
-MAX_POS_PER_INST = 50             # local cap, well inside server floor/ceiling
-QUOTE_SIZE = 5                    # shares per quote side
-MIN_HALF_SPREAD = 5               # cents — never quote tighter than this
-DEFAULT_HALF_SPREAD = 15          # cents — used when book is thin
-INVENTORY_SKEW_CENTS_PER_SHARE = 1   # mid shifts this many cents per share of position
-QUOTE_EXPIRY_MS = 5_000           # rest 5s before auto-cancel
-REQUOTE_THRESHOLD_CENTS = 2       # only cancel/replace when desired quote moves > this
-ETF_ARB_THRESHOLD = 30            # cents of edge before crossing
-ETF_ARB_SIZE = 5                  # shares per IOC fire
-ETF_MAX_POS = 30                  # tighter cap on ETFs (directional risk)
-INVENTORY_RESYNC_INTERVAL_S = 5.0
+# Local strategy params (conservative).
+LOCAL_RATE_LIMIT = 400           # 80% of server limit
+ARB_SIZE = 5                     # shares per IOC fire (per leg)
+ARB_THRESHOLD = 30               # cents of edge before crossing
+ETF_POS_CAP = 20                 # max |ETF position| we'll open
+EXPIRY_MS = 5_000                # IOC expiry window (effectively immediate)
+INVENTORY_RESYNC_INTERVAL_S = 1.0
 RECONNECT_BACKOFF_S = 2.0
+FLATTEN_REMAINING_MS = 30_000    # in last 30s: stop opening, flatten existing
 
 
 # ---------------------------------------------------------------------------
-# Rate limiter
+# Rate limiter (token bucket)
 # ---------------------------------------------------------------------------
 
 class RateLimiter:
-    """Async token bucket. Refills at `rate` tokens/sec, capacity = rate."""
+    """Refills at `rate` tokens/sec, capacity = rate."""
 
     def __init__(self, rate: int):
         self.rate = rate
@@ -153,12 +94,12 @@ class RateLimiter:
 
 
 # ---------------------------------------------------------------------------
-# Per-exchange state
+# State
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Book:
-    bids: dict[int, int] = field(default_factory=dict)  # price -> qty
+    bids: dict[int, int] = field(default_factory=dict)
     asks: dict[int, int] = field(default_factory=dict)
 
     @property
@@ -176,127 +117,76 @@ class Book:
 
 
 @dataclass
-class MyQuote:
-    """Tracks one resting order I placed."""
-    order_id: int
-    side: str       # "bid" or "ask"
-    price: int
-    quantity: int   # original quantity
-
-
-@dataclass
-class ExchangeState:
-    """Everything I know about one exchange."""
-    name: str
+class State:
     books: dict[str, Book] = field(default_factory=lambda: defaultdict(Book))
     positions: dict[str, int] = field(default_factory=lambda: defaultdict(int))
-    cash: int = 10_000_000  # initial: $100k in cents
-    # Per-instrument: my live orders by side -> MyQuote (one quote per side max)
-    my_quotes: dict[tuple[str, str], MyQuote] = field(default_factory=dict)
-    # order_id -> (instrument, side, qty) so events can update positions
-    my_orders: dict[int, tuple[str, str, int]] = field(default_factory=dict)
+    cash: int = 10_000_000
+    server_time_ms: int = 0
+    round_length_ms: int = 600_000  # 10 min default; refreshed from /health
 
 
 # ---------------------------------------------------------------------------
-# Exchange connection
+# Bot
 # ---------------------------------------------------------------------------
 
-class ExchangeClient:
-    """One WS connection. Reconnect loop runs in `run()`."""
-
-    def __init__(self, name: str):
-        self.name = name
-        self.url = f"ws://{EXCHANGE_HOSTS[name]}:{PORT}/trade"
-        self.state = ExchangeState(name=name)
+class Bot:
+    def __init__(self) -> None:
+        self.state = State()
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.limiter = RateLimiter(LOCAL_RATE_LIMIT)
         self.req_id = 0
-        # Map user_request_id -> pending order intent so we can stitch the
-        # add_order_response back to (instrument, side, qty).
-        self.pending: dict[str, tuple[str, str, int, int]] = {}  # rid -> (instr,side,price,qty)
-        self.last_resync = 0.0
+        # rid -> (instrument, side, qty) so we can apply immediate fills.
+        self.pending: dict[str, tuple[str, str, int]] = {}
 
-    def next_rid(self, prefix: str) -> str:
+    def _rid(self, prefix: str) -> str:
         self.req_id += 1
         return f"{prefix}-{self.req_id}"
 
-    async def send(self, msg: dict) -> None:
+    @staticmethod
+    def _instr(ticker: str) -> str:
+        return f"ZSE-{ticker}"
+
+    async def _send(self, msg: dict) -> None:
         await self.limiter.acquire()
         if self.ws is None:
             return
         await self.ws.send(json.dumps(msg))
 
-    async def place_limit(self, instrument: str, side: str, price: int, qty: int,
-                          ioc: bool = False) -> None:
-        rid = self.next_rid("ioc" if ioc else "ord")
-        self.pending[rid] = (instrument, side, price, qty)
-        await self.send({
+    async def _ioc(self, instr: str, side: str, price: int, qty: int) -> None:
+        rid = self._rid("ioc")
+        self.pending[rid] = (instr, side, qty)
+        await self._send({
             "type": "add_order",
             "user_request_id": rid,
-            "instrument_id": instrument,
+            "instrument_id": instr,
             "price": price,
-            "expiry": int(time.time() * 1000) + QUOTE_EXPIRY_MS,
+            "expiry": int(time.time() * 1000) + EXPIRY_MS,
             "side": side,
             "quantity": qty,
-            "order_type": "ioc" if ioc else "limit",
+            "order_type": "ioc",
         })
 
-    async def cancel(self, instrument: str, order_id: int) -> None:
-        await self.send({
-            "type": "cancel_order",
-            "user_request_id": self.next_rid("can"),
-            "order_id": order_id,
-            "instrument_id": instrument,
+    async def _market(self, instr: str, side: str, qty: int) -> None:
+        rid = self._rid("mkt")
+        self.pending[rid] = (instr, side, qty)
+        await self._send({
+            "type": "add_order",
+            "user_request_id": rid,
+            "instrument_id": instr,
+            "side": side,
+            "quantity": qty,
+            "order_type": "market",
         })
 
-    async def get_inventory(self) -> None:
-        await self.send({
-            "type": "get_inventory",
-            "user_request_id": self.next_rid("inv"),
-        })
+    async def _get_inventory(self) -> None:
+        await self._send({"type": "get_inventory", "user_request_id": self._rid("inv")})
 
-    # -- message handlers ---------------------------------------------------
+    # -- message handling --------------------------------------------------
 
-    def _apply_book(self, instrument: str, ob: dict) -> None:
-        b = self.state.books[instrument]
+    def _apply_book(self, instr: str, ob: dict) -> None:
+        b = self.state.books[instr]
         b.bids = {int(p): q for p, q in (ob.get("bids") or {}).items()}
         b.asks = {int(p): q for p, q in (ob.get("asks") or {}).items()}
-
-    def _apply_event(self, ev: dict) -> None:
-        if ev.get("event_type") != "trade":
-            # cancel events: drop our side tracking if it was ours
-            data = ev.get("data") or {}
-            oid = data.get("orderID")
-            if oid in self.state.my_orders:
-                instr, side, _qty = self.state.my_orders.pop(oid)
-                self.state.my_quotes.pop((instr, side), None)
-            return
-        data = ev["data"]
-        oid_p = data["passiveOrderID"]
-        oid_a = data["activeOrderID"]
-        instr = data["instrumentID"]
-        price = int(data["price"])
-        qty = int(data["quantity"])
-        # If the passive order is mine, my side is the resting side.
-        # If active is mine, my side is the resting side's opposite.
-        for oid, is_passive in ((oid_p, True), (oid_a, False)):
-            if oid not in self.state.my_orders:
-                continue
-            my_instr, my_side, my_qty = self.state.my_orders[oid]
-            if my_instr != instr:
-                continue
-            sign = +1 if my_side == "bid" else -1
-            self.state.positions[instr] += sign * qty
-            self.state.cash -= sign * price * qty
-            new_qty = my_qty - qty
-            if new_qty <= 0:
-                self.state.my_orders.pop(oid, None)
-                # remove matching quote if present
-                q = self.state.my_quotes.get((instr, my_side))
-                if q and q.order_id == oid:
-                    self.state.my_quotes.pop((instr, my_side), None)
-            else:
-                self.state.my_orders[oid] = (my_instr, my_side, new_qty)
 
     def _apply_inventory(self, data: dict) -> None:
         for k, v in data.items():
@@ -308,230 +198,203 @@ class ExchangeClient:
             else:
                 self.state.positions[k] = int(total)
 
-    def _apply_add_response(self, msg: dict) -> None:
+    def _apply_add_resp(self, msg: dict) -> None:
         rid = msg.get("user_request_id", "")
         intent = self.pending.pop(rid, None)
         if intent is None:
             return
-        instr, side, price, qty = intent
+        instr, side, _qty = intent
         if not msg.get("success"):
-            log.debug("[%s] add_order failed (%s %s %d@%d): %s",
-                      self.name, side, instr, qty, price,
-                      (msg.get("data") or {}).get("message"))
+            data = msg.get("data") or {}
+            log.debug("add_order failed (%s %s): %s", side, instr, data.get("message"))
             return
         data = msg.get("data") or {}
-        oid = data.get("order_id")
         inv_change = data.get("immediate_inventory_change")
         bal_change = data.get("immediate_balance_change")
-        # Update local cash/position from immediate fills.
         if inv_change is not None:
             self.state.positions[instr] += int(inv_change)
         if bal_change is not None:
             self.state.cash += int(bal_change)
-        immediate_filled = abs(int(inv_change)) if inv_change is not None else 0
-        remainder = qty - immediate_filled
-        if oid is not None and remainder > 0 and rid.startswith("ord"):
-            # Limit order with resting remainder.
-            self.state.my_orders[oid] = (instr, side, remainder)
-            self.state.my_quotes[(instr, side)] = MyQuote(oid, side, price, remainder)
 
-    # -- main loop ----------------------------------------------------------
+    # -- strategy ----------------------------------------------------------
 
-    async def _read_loop(self, bot: "Bot") -> None:
-        assert self.ws is not None
-        async for raw in self.ws:
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                if isinstance(raw, str) and "rate limit" in raw.lower():
-                    log.error("[%s] RATE LIMIT BREACH — server closed connection", self.name)
-                continue
-            t = msg.get("type")
-            if t == "market_data_update":
-                for instr, ob in (msg.get("orderbook_depths") or {}).items():
-                    self._apply_book(instr, ob)
-                for ev in msg.get("events") or []:
-                    self._apply_event(ev)
-                # Drive strategy on every market update for this exchange.
-                await bot.on_tick(self)
-            elif t == "add_order_response":
-                self._apply_add_response(msg)
-            elif t == "cancel_order_response":
-                pass  # success/fail tracked indirectly via cancel events
-            elif t == "get_inventory_response":
-                self._apply_inventory(msg.get("data") or {})
-            elif t == "end_of_round":
-                log.info("[%s] end_of_round received — segment over", self.name)
-                return
-            elif t == "welcome":
-                log.info("[%s] welcome: %s", self.name, msg.get("message"))
-            elif t == "error":
-                log.warning("[%s] error: %s", self.name, msg.get("message"))
+    def _segment_remaining_ms(self) -> int:
+        return max(0, self.state.round_length_ms - self.state.server_time_ms)
 
-    async def _resync_loop(self) -> None:
-        while self.ws is not None:
-            await asyncio.sleep(INVENTORY_RESYNC_INTERVAL_S)
-            try:
-                await self.get_inventory()
-            except Exception:  # noqa: BLE001
-                return
+    def _in_flight(self, instr: str) -> int:
+        """Net signed position delta from orders we sent but haven't seen ack'd."""
+        delta = 0
+        for i, side, q in self.pending.values():
+            if i == instr:
+                delta += q if side == "bid" else -q
+        return delta
 
-    async def run(self, bot: "Bot") -> None:
-        while True:
-            try:
-                async with ws_connect(self.url, max_size=16 * 1024 * 1024) as ws:
-                    self.ws = ws
-                    # Reset per-segment state — exchange just (re)started.
-                    self.state = ExchangeState(name=self.name)
-                    self.pending.clear()
-                    resync = asyncio.create_task(self._resync_loop())
-                    try:
-                        await self.get_inventory()
-                        await self._read_loop(bot)
-                    finally:
-                        resync.cancel()
-            except (websockets.ConnectionClosed, OSError) as e:
-                log.info("[%s] disconnected (%s); reconnecting in %.1fs",
-                         self.name, type(e).__name__, RECONNECT_BACKOFF_S)
-            except Exception as e:  # noqa: BLE001
-                log.exception("[%s] unexpected error: %s — reconnecting", self.name, e)
-            finally:
-                self.ws = None
-            await asyncio.sleep(RECONNECT_BACKOFF_S)
+    def _effective_pos(self, instr: str) -> int:
+        return self.state.positions.get(instr, 0) + self._in_flight(instr)
 
+    def _basket_bid_total(self, basket: list[str]) -> Optional[int]:
+        """Sum of constituent best_bids — revenue if we sold the whole basket."""
+        total = 0
+        for t in basket:
+            book = self.state.books.get(self._instr(t))
+            if book is None or book.best_bid is None:
+                return None
+            total += book.best_bid
+        return total
 
-# ---------------------------------------------------------------------------
-# Strategies
-# ---------------------------------------------------------------------------
+    def _basket_ask_total(self, basket: list[str]) -> Optional[int]:
+        """Sum of constituent best_asks — cost if we bought the whole basket."""
+        total = 0
+        for t in basket:
+            book = self.state.books.get(self._instr(t))
+            if book is None or book.best_ask is None:
+                return None
+            total += book.best_ask
+        return total
 
-class Bot:
-    def __init__(self, exchanges: list[str]):
-        self.clients: dict[str, ExchangeClient] = {x: ExchangeClient(x) for x in exchanges}
-
-    def _instr(self, exchange: str, ticker: str) -> str:
-        return f"{exchange}-{ticker}"
-
-    async def on_tick(self, client: ExchangeClient) -> None:
-        await self._market_make(client)
-        if client.name == "ZSE":
-            await self._etf_arb_zse(client)
-
-    # -- market making ------------------------------------------------------
-
-    async def _market_make(self, client: ExchangeClient) -> None:
-        st = client.state
-        for ticker, _is_etf in instruments_on(client.name):
-            instr = self._instr(client.name, ticker)
-            book = st.books.get(instr)
-            if book is None:
-                continue
-            bb, ba = book.best_bid, book.best_ask
-            if bb is None or ba is None or ba <= bb:
-                continue
-
-            mid = (bb + ba) // 2
-            mm_half = (ba - bb) // 2
-            half = max(MIN_HALF_SPREAD, min(mm_half - 1, DEFAULT_HALF_SPREAD))
-            if half < MIN_HALF_SPREAD:
-                continue  # spread too tight to step inside profitably
-
-            pos = st.positions.get(instr, 0)
-            skew = pos * INVENTORY_SKEW_CENTS_PER_SHARE
-            fair = mid - skew
-
-            cap = ETF_MAX_POS if ticker in ETF_LISTINGS else MAX_POS_PER_INST
-            want_bid = (pos + QUOTE_SIZE) <= cap
-            want_ask = (pos - QUOTE_SIZE) >= -cap
-
-            if want_bid:
-                target_bid = max(bb + 1, fair - half)
-                target_bid = min(target_bid, ba - 1)
-                await self._maybe_quote(client, instr, "bid", target_bid)
-            else:
-                await self._cancel_side(client, instr, "bid")
-
-            if want_ask:
-                target_ask = min(ba - 1, fair + half)
-                target_ask = max(target_ask, bb + 1)
-                await self._maybe_quote(client, instr, "ask", target_ask)
-            else:
-                await self._cancel_side(client, instr, "ask")
-
-    async def _maybe_quote(self, client: ExchangeClient, instr: str,
-                           side: str, target_price: int) -> None:
-        if target_price <= 0:
+    async def _open_arb(self, etf: str, basket: list[str], buy_etf: bool) -> None:
+        """
+        buy_etf=True  → IOC-buy ETF + IOC-sell each constituent at touch.
+        buy_etf=False → IOC-sell ETF + IOC-buy  each constituent at touch.
+        Constituent legs hit the touch on the opposite side of their book.
+        """
+        etf_instr = self._instr(etf)
+        etf_book = self.state.books[etf_instr]
+        if buy_etf:
+            etf_price = etf_book.best_ask
+            etf_side = "bid"
+            leg_side = "ask"
+        else:
+            etf_price = etf_book.best_bid
+            etf_side = "ask"
+            leg_side = "bid"
+        if etf_price is None:
             return
-        existing = client.state.my_quotes.get((instr, side))
-        if existing is not None and abs(existing.price - target_price) <= REQUOTE_THRESHOLD_CENTS:
+        # Send all legs in parallel — token bucket smooths them.
+        await self._ioc(etf_instr, etf_side, etf_price, ARB_SIZE)
+        for t in basket:
+            book = self.state.books[self._instr(t)]
+            px = book.best_bid if leg_side == "ask" else book.best_ask
+            if px is None:
+                continue
+            await self._ioc(self._instr(t), leg_side, px, ARB_SIZE)
+
+    async def _flatten(self) -> None:
+        """Market-flatten any non-zero ETF or constituent positions.
+
+        Uses effective position (live + in-flight) so we don't double-fire while
+        a prior flatten order is still on the wire.
+        """
+        for instr in list(self.state.positions.keys()):
+            qty = self._effective_pos(instr)
+            if qty == 0:
+                continue
+            side = "ask" if qty > 0 else "bid"
+            await self._market(instr, side, abs(qty))
+
+    async def _on_tick(self) -> None:
+        remaining = self._segment_remaining_ms()
+        if remaining <= FLATTEN_REMAINING_MS:
+            await self._flatten()
             return
-        if existing is not None:
-            await client.cancel(instr, existing.order_id)
-            client.state.my_quotes.pop((instr, side), None)
-            client.state.my_orders.pop(existing.order_id, None)
-        await client.place_limit(instr, side, target_price, QUOTE_SIZE, ioc=False)
 
-    async def _cancel_side(self, client: ExchangeClient, instr: str, side: str) -> None:
-        existing = client.state.my_quotes.get((instr, side))
-        if existing is None:
-            return
-        await client.cancel(instr, existing.order_id)
-        client.state.my_quotes.pop((instr, side), None)
-        client.state.my_orders.pop(existing.order_id, None)
-
-    # -- ETF basket arb on ZSE ----------------------------------------------
-
-    async def _etf_arb_zse(self, client: ExchangeClient) -> None:
-        st = client.state
         for etf, basket in ETF_BASKETS.items():
-            etf_instr = self._instr("ZSE", etf)
-            etf_book = st.books.get(etf_instr)
+            etf_instr = self._instr(etf)
+            etf_book = self.state.books.get(etf_instr)
             if etf_book is None:
                 continue
             ebb, eba = etf_book.best_bid, etf_book.best_ask
             if ebb is None or eba is None:
                 continue
 
-            # Basket fair = mean of constituent mids on ZSE.
-            mids: list[int] = []
-            for t in basket:
-                bk = st.books.get(self._instr("ZSE", t))
-                if bk is None or bk.mid is None:
-                    break
-                mids.append(bk.mid)
-            if len(mids) != len(basket):
+            n = len(basket)
+            pos = self._effective_pos(etf_instr)
+
+            # Buy 1 ETF + sell 1 of each constituent. Net cents per ETF share:
+            #   edge = (Σ constituent_bids) / n  -  eba
+            # Use multiplied-by-n form to avoid integer division rounding.
+            sell_basket_total = self._basket_bid_total(basket)
+            if sell_basket_total is not None \
+               and sell_basket_total - eba * n >= ARB_THRESHOLD * n \
+               and pos + ARB_SIZE <= ETF_POS_CAP:
+                await self._open_arb(etf, basket, buy_etf=True)
                 continue
-            fair = sum(mids) // len(mids)
 
-            pos = st.positions.get(etf_instr, 0)
-            # ETF too cheap to buy: ask < fair - threshold and we have room to go long.
-            if eba <= fair - ETF_ARB_THRESHOLD and pos + ETF_ARB_SIZE <= ETF_MAX_POS:
-                await client.place_limit(etf_instr, "bid", eba, ETF_ARB_SIZE, ioc=True)
-            # ETF too rich to sell: bid > fair + threshold and we have room to go short.
-            elif ebb >= fair + ETF_ARB_THRESHOLD and pos - ETF_ARB_SIZE >= -ETF_MAX_POS:
-                await client.place_limit(etf_instr, "ask", ebb, ETF_ARB_SIZE, ioc=True)
+            # Sell 1 ETF + buy 1 of each constituent. Edge:
+            #   edge = ebb  -  (Σ constituent_asks) / n
+            buy_basket_total = self._basket_ask_total(basket)
+            if buy_basket_total is not None \
+               and ebb * n - buy_basket_total >= ARB_THRESHOLD * n \
+               and pos - ARB_SIZE >= -ETF_POS_CAP:
+                await self._open_arb(etf, basket, buy_etf=False)
 
-    # -- entry --------------------------------------------------------------
+    # -- main loop ---------------------------------------------------------
+
+    async def _read_loop(self) -> None:
+        assert self.ws is not None
+        async for raw in self.ws:
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                if isinstance(raw, str) and "rate limit" in raw.lower():
+                    log.error("RATE LIMIT BREACH — server closed connection")
+                continue
+            t = msg.get("type")
+            if t == "market_data_update":
+                self.state.server_time_ms = int(msg.get("time", 0))
+                for instr, ob in (msg.get("orderbook_depths") or {}).items():
+                    self._apply_book(instr, ob)
+                await self._on_tick()
+            elif t == "add_order_response":
+                self._apply_add_resp(msg)
+            elif t == "get_inventory_response":
+                self._apply_inventory(msg.get("data") or {})
+            elif t == "end_of_round":
+                log.info("end_of_round received — segment over")
+                return
+            elif t == "welcome":
+                log.info("welcome: %s", msg.get("message"))
+            elif t == "error":
+                log.warning("server error: %s", msg.get("message"))
+
+    async def _resync_loop(self) -> None:
+        while self.ws is not None:
+            await asyncio.sleep(INVENTORY_RESYNC_INTERVAL_S)
+            try:
+                await self._get_inventory()
+            except Exception:  # noqa: BLE001
+                return
 
     async def run(self) -> None:
-        await asyncio.gather(*(c.run(self) for c in self.clients.values()))
+        while True:
+            try:
+                async with ws_connect(URL, max_size=16 * 1024 * 1024) as ws:
+                    self.ws = ws
+                    self.state = State()       # fresh per segment
+                    self.pending.clear()
+                    resync = asyncio.create_task(self._resync_loop())
+                    try:
+                        await self._get_inventory()
+                        await self._read_loop()
+                    finally:
+                        resync.cancel()
+            except (websockets.ConnectionClosed, OSError) as e:
+                log.info("disconnected (%s); reconnecting in %.1fs",
+                         type(e).__name__, RECONNECT_BACKOFF_S)
+            except Exception as e:  # noqa: BLE001
+                log.exception("unexpected error: %s — reconnecting", e)
+            finally:
+                self.ws = None
+            await asyncio.sleep(RECONNECT_BACKOFF_S)
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    raw = os.environ.get("EXCHANGES", ",".join(EXCHANGE_HOSTS.keys()))
-    exchanges = [x.strip() for x in raw.split(",") if x.strip()]
-    unknown = [x for x in exchanges if x not in EXCHANGE_HOSTS]
-    if unknown:
-        raise SystemExit(f"Unknown exchange(s): {unknown}")
-    log.info("starting bot on exchanges: %s", exchanges)
-    asyncio.run(Bot(exchanges).run())
+    log.info("starting ZSE basket-arb bot (URL=%s)", URL)
+    asyncio.run(Bot().run())
 
 
 if __name__ == "__main__":
