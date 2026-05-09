@@ -212,6 +212,47 @@ class RailEdgeStrategyTests(unittest.TestCase):
         self.assertEqual(bids, [])
 
 
+class CashReservationTests(unittest.TestCase):
+    def test_server_reserved_cash_excludes_room_for_more_bids(self):
+        # Server says: total $100k, of which $80k is already reserved on
+        # resting bids the bot may not know about. Free = $20k. Bot must
+        # NOT issue a bid that would push us past the −$50k floor.
+        config = default_rail_configs()["NASDAQ"]
+        state = ExchangeState(exchange="NASDAQ")
+        state.apply_inventory({"$": [8_000_000, 10_000_000]})
+        # locally we don't have any pending orders — without server-reserved
+        # tracking, the old code would think $150k is deployable.
+        strategy = RailEdgeStrategy(config)
+        orders = strategy.plan_orders(state, depth=None, now_ms=1_000)
+        bids = [o for o in orders if o["side"] == "bid"]
+        self.assertEqual(len(bids), 1)
+        # cash_room = 10M − 8M reserved − 0 inflight − 100k buffer + 5M floor = 6.9M
+        # cash_qty  = 6_900_000 // 7001 = 985 shares; capped at lot_size=200
+        self.assertEqual(bids[0]["quantity"], config.lot_size)
+
+    def test_server_reserved_eats_all_room_blocks_new_bids(self):
+        config = default_rail_configs()["NASDAQ"]
+        state = ExchangeState(exchange="NASDAQ")
+        # total $100k, all $100k already reserved → free=0, floor blocks more
+        state.apply_inventory({"$": [10_000_000, 10_000_000]})
+        # plus $50k inflight that hasn't hit the server yet
+        state.track_inflight(
+            PendingOrder(
+                local_id="recent",
+                instrument="NASDAQ-CARD",
+                side="bid",
+                price=7001,
+                quantity=714,  # 714*7001 ≈ $50k
+                order_type="limit",
+                role="rail",
+            )
+        )
+        strategy = RailEdgeStrategy(config)
+        orders = strategy.plan_orders(state, depth=None, now_ms=2_000)
+        bids = [o for o in orders if o["side"] == "bid"]
+        self.assertEqual(bids, [])
+
+
 class ForceCloseTests(unittest.TestCase):
     def test_long_inventory_force_closes_with_market_after_timeout(self):
         config = default_rail_configs()["NASDAQ"]

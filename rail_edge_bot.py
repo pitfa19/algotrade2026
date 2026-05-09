@@ -101,6 +101,10 @@ class PendingOrder:
 class ExchangeState:
     exchange: str
     cash: int = INITIAL_CASH
+    # Cash the server has reserved for our resting bids. Updated only by
+    # get_inventory_response — this is the *server's* truth, not derived
+    # from our local order book.
+    server_reserved_cash: int = 0
     positions: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     live_orders: dict[int, LiveOrder] = field(default_factory=dict)
     inflight_orders: dict[str, PendingOrder] = field(default_factory=dict)
@@ -113,6 +117,8 @@ class ExchangeState:
     def apply_inventory(self, data: dict[str, list[int]]) -> None:
         cash_pair = data.get("$")
         if cash_pair is not None:
+            # data["$"] = [reserved, total]
+            self.server_reserved_cash = int(cash_pair[0])
             self.cash = int(cash_pair[1])
 
         for instrument, pair in data.items():
@@ -192,6 +198,16 @@ class ExchangeState:
             if order.side == "bid"
         )
         return live_value + inflight_value
+
+    def inflight_bid_value(self) -> int:
+        """Cash committed by bids we've sent locally but the server may not
+        yet have acknowledged. The server's `server_reserved_cash` covers
+        anything it already knows about; this covers the gap."""
+        return sum(
+            max(0, order.quantity) * int(order.price or 0)
+            for order in self.inflight_orders.values()
+            if order.side == "bid"
+        )
 
 
 def default_rail_configs() -> dict[str, RailConfig]:
@@ -399,10 +415,28 @@ class RailEdgeStrategy:
         pending_qty = state.pending_qty(
             instrument, side="bid", price=self.config.low_bid_price, role="rail"
         ) + int(extra_reserved)
-        cash_room = state.cash - state.pending_bid_value() - CASH_FLOOR
+        # Reconcile against the server's *own* reservation accounting:
+        #   free = total_cash − server_reserved − inflight − safety_buffer − FLOOR
+        # Whatever the server has already locked in is in server_reserved_cash;
+        # adding inflight_bid_value avoids double-counting our own resting
+        # bids (which the server has already reserved). The buffer absorbs
+        # tick-level drift between get_inventory polls.
+        cash_room = (
+            state.cash
+            - state.server_reserved_cash
+            - state.inflight_bid_value()
+            - self._safety_buffer_cents()
+            - CASH_FLOOR
+        )
         cash_qty = max(0, cash_room // self.config.low_bid_price)
         capacity = max(0, min(position_room - pending_qty, cash_qty))
         return min(capacity, int(self.config.lot_size))
+
+    @staticmethod
+    def _safety_buffer_cents() -> int:
+        # 1% of starting cash — keeps us comfortably away from the floor
+        # under realistic fill bursts between inventory polls.
+        return INITIAL_CASH // 100
 
     def _rail_ask_quantity(self, state: ExchangeState, extra_reserved: int = 0) -> int:
         instrument = self.config.instrument
@@ -536,10 +570,19 @@ class RailEdgeBot:
                 async with websockets.connect(url, max_size=16 * 1024 * 1024) as ws:
                     print(f"[{exchange}] connected {url}", flush=True)
                     backoff = 1.0
+                    # On (re)connect, ask for both inventory and any orders
+                    # already resting on the server. The pending-orders sync
+                    # is critical: rail bids carried over from a previous
+                    # session would otherwise appear as server-reserved cash
+                    # we don't know about, leading to "insufficient balance"
+                    # when we try to add new bids.
                     await self._send_json(
-                        ws,
-                        limiter,
+                        ws, limiter,
                         {"type": "get_inventory", "user_request_id": f"{exchange}-inventory-0"},
+                    )
+                    await self._send_json(
+                        ws, limiter,
+                        {"type": "get_pending_orders", "user_request_id": f"{exchange}-pending-0"},
                     )
 
                     async for raw in ws:
@@ -556,10 +599,22 @@ class RailEdgeBot:
                             state.apply_inventory(message.get("data", {}))
                             continue
 
+                        if msg_type == "get_pending_orders_response":
+                            self._hydrate_live_orders(state, message.get("data", {}))
+                            continue
+
                         if msg_type == "add_order_response":
-                            self._handle_add_order_response(
+                            had_immediate_fill = self._handle_add_order_response(
                                 exchange, state, strategy, pending, message
                             )
+                            if had_immediate_fill:
+                                # bring our cash view back in sync immediately
+                                seq += 1
+                                await self._send_json(
+                                    ws, limiter,
+                                    {"type": "get_inventory",
+                                     "user_request_id": f"{exchange}-{seq}-postfill"},
+                                )
                             continue
 
                         if msg_type != "market_data_update":
@@ -631,32 +686,81 @@ class RailEdgeBot:
         strategy: RailEdgeStrategy,
         pending: dict[str, PendingOrder],
         message: dict[str, Any],
-    ) -> None:
+    ) -> bool:
+        """Returns True iff the response carried an immediate fill that
+        changed our cash view (caller should re-poll inventory)."""
         request_id = message.get("user_request_id")
         order = pending.pop(request_id, None)
         state.drop_inflight(request_id)
         if order is None:
-            return
+            return False
 
         data = message.get("data", {})
         if not message.get("success"):
-            print(f"[{exchange}] add_order failed: {data.get('message')}", flush=True)
-            return
+            msg = (data or {}).get("message") if isinstance(data, dict) else None
+            print(f"[{exchange}] add_order failed: {msg}", flush=True)
+            # On a server-side rejection we MAY be out of sync with the
+            # server's reservation accounting. Trigger a re-poll on the
+            # next loop iteration by clearing inflight (already done).
+            return True
+
+        had_fill = bool(
+            data.get("immediate_inventory_change")
+            or data.get("immediate_balance_change")
+        )
 
         if order.role == "rail":
+            # Rail orders may also have crossed at placement (rare for $70
+            # bids but possible for the $110 short-rail when the touch is
+            # crossed). Apply that fill before tracking the resting remainder.
+            if had_fill:
+                strategy.apply_immediate_fill(state, order, data)
             order_id = data.get("order_id")
             if order_id is not None:
-                state.track_order(
-                    local_id=order.local_id,
-                    order_id=int(order_id),
-                    instrument=order.instrument,
-                    side=order.side,
-                    price=int(order.price or 0),
-                    quantity=order.quantity,
-                    role=order.role,
-                )
+                inv_change = int(data.get("immediate_inventory_change") or 0)
+                resting_qty = max(0, order.quantity - abs(inv_change))
+                if resting_qty > 0:
+                    state.track_order(
+                        local_id=order.local_id,
+                        order_id=int(order_id),
+                        instrument=order.instrument,
+                        side=order.side,
+                        price=int(order.price or 0),
+                        quantity=resting_qty,
+                        role=order.role,
+                    )
         else:
             strategy.apply_immediate_fill(state, order, data)
+        return had_fill
+
+    def _hydrate_live_orders(self, state: ExchangeState, data: dict[str, Any]) -> None:
+        """Repopulate live_orders from a get_pending_orders_response so our
+        local view matches what the server has resting. Without this, any
+        rail order that survived a reconnect would be invisible to
+        pending_bid_value() and we'd over-deploy cash."""
+        for instrument, sides in (data or {}).items():
+            if not isinstance(sides, list) or len(sides) != 2:
+                continue
+            bid_orders, ask_orders = sides
+            for side_name, group in (("bid", bid_orders), ("ask", ask_orders)):
+                for entry in group or []:
+                    try:
+                        oid = int(entry["orderID"])
+                        price = int(entry["price"])
+                        unfilled = int(entry["unfilled_quantity"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if unfilled <= 0:
+                        continue
+                    state.live_orders[oid] = LiveOrder(
+                        local_id=f"hydrated-{oid}",
+                        order_id=oid,
+                        instrument=instrument,
+                        side=side_name,
+                        price=price,
+                        remaining=unfilled,
+                        role="rail",
+                    )
 
     @staticmethod
     async def _send_json(ws: Any, limiter: TokenBucket, payload: dict[str, Any]) -> None:
