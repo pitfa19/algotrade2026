@@ -60,7 +60,11 @@ Avoid running these together:
 - `fabijan_v1.py` and `fabijan_v3.py`: both consume ZSE basket-arb risk.
 - `fabijan_v2.py` and `fabijan_v3.py`: both consume cross-venue ETF risk.
 - `edge_trader_bot.py` and `codex_bot.py`: both can trade broad multi-venue arb.
+- `codex_bot.py` and `codex_bot_v2.py`: same family, same edges, will fight.
+- `namikv1.py` and `namikv2.py`: same family, same edges, will fight.
 - `prism.py` and any other active trading bot: `prism.py` is broad and aggressive.
+- `parallax.py` and any other active trading bot: `parallax.py` is the broadest in the repo.
+- `parallax.py` and `prism.py`: maximum overlap; both fire ETF/basket/sub-ETF/xv arbs.
 
 Safe combinations:
 
@@ -91,6 +95,15 @@ tmux new -s prism
 LOGLEVEL=INFO python3 prism.py
 ```
 
+For the same risk profile but with consensus-FV triangulation, vol-adaptive
+edges, statistical FV snipes, sector residual hedged via the ETF, and an
+inventory + flow-skewed market maker, use:
+
+```bash
+tmux new -s parallax
+LOGLEVEL=INFO python3 parallax.py --venues ZSE,NYSE,TMX
+```
+
 ## 4. Bot Scores
 
 Scores are operator scores from 1-10, not guaranteed PnL.
@@ -104,8 +117,10 @@ Scores are operator scores from 1-10, not guaranteed PnL.
 | `codex_bot.py` | Yes | Broad microprice, latency, sector, ETF lead-lag | 5 | 8 | 8 | 6 | 7 | Experimental broad bot |
 | `codex_bot_v2.py` | Yes | Newer broad Codex variant | 5 | 8 | 8 | 6 | 7 | Experimental, compare to `codex_bot.py` |
 | `namikv1.py` | Yes | Full multi-strategy with hedge/adaptive features | 5 | 8 | 9 | 6 | 7 | Advanced experimental |
+| `namikv2.py` | Yes | namikv1 + ETF-implied stock fair value, more strategies | 5 | 8 | 9 | 5 | 7 | Newer Namik variant — compare dry-run to v1 |
 | `alpha_bot.py` | Yes | MM-skew, non-50 size, CARD/SIMP, adaptive thresholds | 5 | 8 | 9 | 6 | 7 | Advanced experimental |
 | `prism.py` | Yes | Multi-venue ETF/basket/sub-ETF/stock arb + passive MM | 4 | 9 | 10 | 6 | 7 | Highest ambition, highest blast radius |
+| `parallax.py` | Yes | prism edges + consensus FV, vol-adaptive thresholds, stat FV snipe, sector residual ETF-hedged, SH coherence, inv+flow-skewed MM | 4 | 10 | 10 | 5 | 8 | Broadest bot in the repo; highest expected edge but highest blast radius |
 | `history_bot.py` | No | Data capture | 10 | N/A | 2 | 9 | 9 | Always useful in tests |
 | `analyzerbot.py` | No | Offline analysis and scoring | 10 | N/A | 2 | 9 | 9 | Run after captures |
 | `dashboard.py` | No | Monitoring UI | 8 | N/A | 4 | 7 | 7 | Useful if connection budget permits |
@@ -452,6 +467,47 @@ Flags:
 
 Admin score: 7/10. Powerful but complex.
 
+### `namikv2.py`
+
+Purpose: newer Namik variant. Same async/websocket core as `namikv1.py`,
+adds ETF-implied stock fair value (back out a stock's price from ETF and
+co-constituents), more strategies, and the same env-driven feature gates.
+
+Conservative live run:
+
+```bash
+tmux new -s namik2
+LIVE_TRADING=1 \
+EXCHANGES=ZSE,NASDAQ,HKEX,NYSE \
+HOME_LOCATION=ZSE \
+ORDER_QTY=5 \
+MIN_EDGE_CENTS=20 \
+MAX_ORDERS_PER_TICK=2 \
+MAX_MSGS_PER_SEC=250 \
+LATENCY_ARB=1 \
+SECTOR_ARB=1 \
+ETF_BASKET_ARB=1 \
+HEDGE=1 \
+ADAPTIVE_THRESHOLD=1 \
+INVENTORY_SKEW=1 \
+UNWIND=1 \
+PASSIVE_ENABLED=0 \
+python3 namikv2.py
+```
+
+Flags are the same family as `namikv1.py`:
+
+```text
+LIVE_TRADING, EXCHANGES, HOME_LOCATION, MIN_EDGE_CENTS, ORDER_QTY,
+MAX_ORDERS_PER_TICK, MAX_MSGS_PER_SEC, LATENCY_ARB, SECTOR_ARB,
+ETF_BASKET_ARB, HEDGE, ADAPTIVE_THRESHOLD, INVENTORY_SKEW, UNWIND,
+PASSIVE_ENABLED, BOT_OUTPUT_DIR
+```
+
+Do not run with `namikv1.py` — they share the same edges and will fight.
+
+Admin score: 7/10. Compare dry-run output against `namikv1.py` before live.
+
 ### `alpha_bot.py`
 
 Purpose: experimental full-market bot using MM-skew inference, non-50 top-size
@@ -549,6 +605,102 @@ EOS_FLATTEN_MS=8000
 
 Admin score: 7/10 overall, but 4/10 safety. Use only after observing it on a
 small venue subset.
+
+### `parallax.py`
+
+Purpose: broadest strategy bot in the repo. Treats every quote as a
+latency-delayed observation of one fair value and triangulates a consensus
+FV per ticker. Trades stale quotes wherever they appear.
+
+Strategies (priority order):
+
+- ETF versus basket arbitrage, multi-venue routed.
+- Sub-ETF identity arbitrage (`6·ETFA = 3·ETFA3 + complement`, same for B).
+- Cross-venue same-stock arbitrage.
+- Statistical fair-value snipe (single-leg) when a venue's quote is far off
+  consensus FV in σ-multiples; capped per-ticker gross-inventory exposure.
+- Sector residual mean-reversion, hedged with the matching sector ETF.
+- Safe-haven coherence guard — fades ETFSH when synth-market and SH index
+  drift in the same direction.
+- Inventory- and flow-skewed two-sided market making on a small set.
+- Settlement-aware unwind — last 60 s ramp, last 8 s IOC sweep.
+
+Defensive layer:
+
+- Local 400 msg/s/exchange token bucket.
+- Atomic plan validation (every leg's headroom checked before any leg ships).
+- Periodic `get_inventory` reconcile against truth.
+- Volatility-adaptive edge threshold per ticker.
+- Aggressor-flow window per ticker, used as gate on stat-arb and MM skew.
+- Plans ranked by edge and capped per tick.
+
+There is no `LIVE_TRADING` gate in the file. Treat as live by default.
+
+Subset test run:
+
+```bash
+tmux new -s parallax-test
+LOGLEVEL=INFO python3 parallax.py --venues ZSE,NYSE,TMX
+```
+
+Full run:
+
+```bash
+tmux new -s parallax
+LOGLEVEL=INFO python3 parallax.py
+```
+
+Flags:
+
+| Flag/Env | Default | Meaning |
+|---|---:|---|
+| `--venues` | all 10 | Comma-separated venue subset |
+| `LOGLEVEL` | `INFO` | Logging verbosity |
+
+Important constants in file (tuned to be unambiguously more aggressive than
+`prism.py` in every regime — calm, choppy, and high-vol):
+
+```text
+RATE_PER_S=400
+SOFT_POS_MAX=1800
+SOFT_POS_MIN=-180
+MIN_ARB_EDGE=2                  # prism ARB_EDGE=4, XV_EDGE=3
+SUB_ETF_EDGE=4                  # prism: 6
+EDGE_VOL_K=0.6                  # additive: edge = MIN + k·σ_tick
+STAT_EDGE_SIGMA=1.8             # statistical FV-snipe threshold (σ-multiples)
+STAT_MAX_QTY=35
+STAT_MAX_INVENTORY=250
+SECTOR_Z_THRESHOLD=1.5
+SECTOR_MAX_QTY=25
+SH_GUARD_THRESHOLD=25
+SH_GUARD_MAX_QTY=12
+ARB_MAX_K=45                    # prism: 25
+XV_MAX_QTY=60                   # prism: 40
+MM_QTY_BASE=10                  # prism MM_QTY: 4
+MM_QTY_MAX=24
+MM_REFRESH_S=0.8                # prism: 1.5
+MM_INSTRUMENTS=CARD,SIMP,ETFA,ETFB,ETFA3,ETFB3,GOLD,XAG,ETFSH
+MAX_PLANS_PER_TICK=30           # prism: uncapped
+EOS_UNWIND_MS=60000
+EOS_FLATTEN_MS=8000
+```
+
+Empirical edge thresholds: in calm markets `edge_for() ≈ 2.1c`; after a
+vol spike it rises to roughly `3.8c`, still under prism's flat `4c`.
+
+Tuning notes:
+
+- If the bot trips the rate-limit close, raise `MAX_PLANS_PER_TICK`,
+  `MM_REFRESH_S`, and consider trimming `MM_INSTRUMENTS`.
+- If positions hit soft caps too often, raise `MIN_ARB_EDGE` to 3 and
+  drop `STAT_MAX_INVENTORY` back toward 100.
+- Set `EDGE_VOL_K=0` to make all edges flat at the floor (most aggressive).
+- If the stat-arb loses money — meaning the consensus FV is wrong — raise
+  `STAT_EDGE_SIGMA` to 2.5 or disable by setting `STAT_MAX_INVENTORY=0`.
+
+Admin score: 8/10 overall, 4/10 safety. Highest expected edge in the repo
+on paper, but the broadest blast radius. Run on a small venue subset before
+expanding.
 
 ### `dashboard.py`
 
@@ -702,8 +854,9 @@ Use this during a round:
 | First live attempt, want stability | `fabijan_v1.py` |
 | ETF locks across Euronext/ZSE/LSE/TMX are visible | `fabijan_v2.py` or `fabijan_v3.py` |
 | Analyzer shows repeated routes like `INA HKEX -> NASDAQ` | `edge_trader_bot.py` |
-| You want broad alpha and can monitor closely | `codex_bot.py`, `namikv1.py`, or `alpha_bot.py` |
+| You want broad alpha and can monitor closely | `codex_bot.py`, `codex_bot_v2.py`, `namikv1.py`, `namikv2.py`, or `alpha_bot.py` |
 | You want maximum ambition and accept risk | `prism.py --venues ...` |
+| You want broader-than-prism alpha with consensus FV, stat snipes, and inventory-skewed MM | `parallax.py --venues ...` |
 | You are in a testing round | `history_bot.py` + `analyzerbot.py` |
 | Official dashboard is poor | `dashboard.py` |
 | You need a C++ starting point | `demo_bot.cpp`; use `bot.cpp` only after a small-venue build check |
