@@ -2,7 +2,13 @@ import unittest
 
 from edgehammer import (
     Book,
+    EdgeHammerEngine,
+    ExchangeClient,
+    Opportunity,
+    OrderLeg,
     SimAccount,
+    StrategyConfig,
+    clip_opportunity_for_live,
     find_cross_venue_arbs,
     find_local_basket_arbs,
     special_target,
@@ -66,6 +72,53 @@ class EdgeHammerCoreTests(unittest.TestCase):
         filled = account.apply_ioc("NYSE-CARD", "ask", Book(bids=[(100, 500)], asks=[]), 5000)
         self.assertEqual(filled, 400)
         self.assertEqual(account.positions["NYSE-CARD"], -200)
+
+    def test_live_clip_skips_stale_sell_when_short_capacity_is_gone(self):
+        states = {"NASDAQ": {"NASDAQ-CARD": Book(bids=[(106, 200)], asks=[(107, 200)])}}
+        account = SimAccount()
+        account.positions["NASDAQ-CARD"] = -200
+        accounts = {"NASDAQ": account}
+        opp = Opportunity(
+            "cross:CARD:NYSE->NASDAQ",
+            1000,
+            [OrderLeg("NASDAQ", "NASDAQ-CARD", "ask", 200, 106)],
+        )
+
+        self.assertIsNone(clip_opportunity_for_live(opp, states, accounts))
+
+    def test_live_clip_resizes_paired_cross_to_current_sell_capacity(self):
+        states = {
+            "NYSE": {"NYSE-CARD": Book(bids=[(99, 200)], asks=[(100, 200)])},
+            "NASDAQ": {"NASDAQ-CARD": Book(bids=[(106, 200)], asks=[(107, 200)])},
+        }
+        accounts = {"NYSE": SimAccount(), "NASDAQ": SimAccount()}
+        accounts["NASDAQ"].positions["NASDAQ-CARD"] = -150
+        opp = Opportunity(
+            "cross:CARD:NYSE->NASDAQ",
+            1200,
+            [
+                OrderLeg("NYSE", "NYSE-CARD", "bid", 200, 100),
+                OrderLeg("NASDAQ", "NASDAQ-CARD", "ask", 200, 106),
+            ],
+        )
+
+        clipped = clip_opportunity_for_live(opp, states, accounts)
+
+        self.assertIsNotNone(clipped)
+        self.assertEqual([leg.quantity for leg in clipped.legs], [50, 50])
+
+    def test_inventory_sync_clears_stale_positions_for_exchange(self):
+        engine = EdgeHammerEngine(StrategyConfig(venues=("NYSE",)))
+        client = ExchangeClient("NYSE", engine)
+        account = engine.accounts["NYSE"]
+        account.cash = 1
+        account.positions["NYSE-CARD"] = 100
+
+        client.apply_inventory({"$": [0, 10_000_000]})
+
+        self.assertTrue(client.inventory_ready)
+        self.assertEqual(account.cash, 10_000_000)
+        self.assertEqual(account.positions["NYSE-CARD"], 0)
 
 
 if __name__ == "__main__":

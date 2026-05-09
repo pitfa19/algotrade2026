@@ -13,7 +13,7 @@ import csv
 import json
 import os
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -422,6 +422,80 @@ def build_target_opportunity(
     return Opportunity(label, edge, [OrderLeg(exchange_name, inst, side, quantity, price, label)], priority=priority)
 
 
+def visible_quantity_at_limit(book: Book, side: str, price: int) -> int:
+    if side == "bid":
+        return sum(quantity for ask_price, quantity in book.asks if ask_price <= price)
+    if side == "ask":
+        return sum(quantity for bid_price, quantity in book.bids if bid_price >= price)
+    return 0
+
+
+def safe_leg_quantity(leg: OrderLeg, states: Dict[str, Dict[str, Book]], accounts: Dict[str, SimAccount]) -> int:
+    if leg.quantity <= 0 or leg.price <= 0:
+        return 0
+    account = accounts.get(leg.exchange)
+    book = states.get(leg.exchange, {}).get(leg.instrument_id)
+    if account is None or book is None:
+        return 0
+    visible = visible_quantity_at_limit(book, leg.side, leg.price)
+    if leg.side == "bid":
+        cash_capacity = (account.cash - account.cash_floor) // leg.price
+        position_capacity = account.long_limit - account.positions[leg.instrument_id]
+        return max(0, min(leg.quantity, visible, cash_capacity, position_capacity))
+    if leg.side == "ask":
+        return max(0, min(leg.quantity, visible, account.sell_capacity(leg.instrument_id)))
+    return 0
+
+
+def clip_opportunity_for_live(
+    opportunity: Opportunity,
+    states: Dict[str, Dict[str, Book]],
+    accounts: Dict[str, SimAccount],
+) -> Optional[Opportunity]:
+    if not opportunity.legs:
+        return None
+
+    safe_quantities = [safe_leg_quantity(leg, states, accounts) for leg in opportunity.legs]
+    if any(quantity <= 0 for quantity in safe_quantities):
+        return None
+
+    if len(opportunity.legs) == 1:
+        leg = opportunity.legs[0]
+        quantity = min(leg.quantity, safe_quantities[0])
+        if quantity <= 0:
+            return None
+        return Opportunity(
+            opportunity.label,
+            opportunity.edge_cents,
+            [OrderLeg(leg.exchange, leg.instrument_id, leg.side, quantity, leg.price, leg.label)],
+            opportunity.priority,
+        )
+
+    base_units = _quantity_gcd([leg.quantity for leg in opportunity.legs])
+    if base_units <= 0:
+        return None
+    ratios = [leg.quantity // base_units for leg in opportunity.legs]
+    clipped_units = min(safe // ratio for safe, ratio in zip(safe_quantities, ratios))
+    if clipped_units <= 0:
+        return None
+
+    clipped_legs = [
+        OrderLeg(leg.exchange, leg.instrument_id, leg.side, ratio * clipped_units, leg.price, leg.label)
+        for leg, ratio in zip(opportunity.legs, ratios)
+    ]
+    clipped_edge = opportunity.edge_cents * clipped_units // base_units
+    return Opportunity(opportunity.label, clipped_edge, clipped_legs, opportunity.priority)
+
+
+def _quantity_gcd(values: Sequence[int]) -> int:
+    result = 0
+    for value in values:
+        value = abs(value)
+        while value:
+            result, value = value, result % value
+    return result
+
+
 def median(values: Sequence[float]) -> float:
     ordered = sorted(values)
     if not ordered:
@@ -439,13 +513,20 @@ class TokenBucket:
         self.updated = time.monotonic()
 
     def take(self, count: int = 1) -> bool:
-        now = time.monotonic()
-        self.tokens = min(self.rate, self.tokens + (now - self.updated) * self.rate)
-        self.updated = now
+        self._refill()
         if self.tokens >= count:
             self.tokens -= count
             return True
         return False
+
+    def can_take(self, count: int = 1) -> bool:
+        self._refill()
+        return self.tokens >= count
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        self.tokens = min(self.rate, self.tokens + (now - self.updated) * self.rate)
+        self.updated = now
 
 
 @dataclass
@@ -472,6 +553,7 @@ class EdgeHammerEngine:
         self.states: Dict[str, Dict[str, Book]] = {venue: {} for venue in config.venues}
         self.history: Dict[str, Deque[Tuple[int, float]]] = defaultdict(deque)
         self.clients: Dict[str, "ExchangeClient"] = {}
+        self._fire_lock = asyncio.Lock()
 
     def update_books(self, venue: str, books: Dict[str, Book], server_time: int) -> None:
         self.states[venue] = books
@@ -589,13 +671,28 @@ class EdgeHammerEngine:
         return self.accounts[leg.exchange].apply_ioc(leg.instrument_id, leg.side, book, leg.quantity)
 
     async def fire_live(self, server_time: int) -> None:
-        for opp in self.opportunities(server_time):
-            for leg in opp.legs:
-                client = self.clients.get(leg.exchange)
-                if client is None or client.ws is None:
+        async with self._fire_lock:
+            for opp in self.opportunities(server_time):
+                clipped = clip_opportunity_for_live(opp, self.states, self.accounts)
+                if clipped is None:
                     continue
-                sent = await client.send_ioc(leg, leg.quantity)
-                if sent:
+                required_tokens = Counter(leg.exchange for leg in clipped.legs)
+                if any(
+                    (client := self.clients.get(venue)) is None
+                    or client.ws is None
+                    or not client.inventory_ready
+                    or not client.bucket.can_take(count)
+                    for venue, count in required_tokens.items()
+                ):
+                    continue
+                sent_legs = []
+                for leg in clipped.legs:
+                    client = self.clients[leg.exchange]
+                    if await client.send_ioc(leg, leg.quantity):
+                        sent_legs.append(leg)
+                if len(sent_legs) != len(clipped.legs):
+                    continue
+                for leg in sent_legs:
                     self.apply_optimistic_leg(leg)
 
 
@@ -610,6 +707,7 @@ class ExchangeClient:
         self.request_id = 0
         self.last_inventory_request = 0.0
         self.server_time = 0
+        self.inventory_ready = False
 
     async def run(self) -> None:
         if ws_connect is None:
@@ -619,8 +717,10 @@ class ExchangeClient:
             try:
                 async with ws_connect(self.url, compression=None, max_size=16 * 1024 * 1024) as ws:
                     self.ws = ws
+                    self.inventory_ready = False
                     backoff = 0.25
                     await ws.recv()
+                    await self.request_inventory(force=True)
                     async for raw in ws:
                         await self.handle_message(raw)
             except Exception as exc:
@@ -639,24 +739,37 @@ class ExchangeClient:
             books = parse_live_books(msg.get("orderbook_depths", {}))
             self.engine.update_books(self.venue, books, self.server_time)
             await self.maybe_request_inventory()
-            await self.fire()
+            if self.inventory_ready:
+                await self.fire()
         elif kind == "get_inventory_response":
             self.apply_inventory(msg.get("data", {}))
         elif kind == "add_order_response" and not msg.get("success", False):
             data = msg.get("data") or {}
-            print(f"[{self.venue}] order failed: {data.get('message')}", flush=True)
+            message = str(data.get("message"))
+            print(f"[{self.venue}] order failed: {message}", flush=True)
+            lowered = message.lower()
+            if "insufficient" in lowered or "limit" in lowered:
+                self.inventory_ready = False
+                await self.request_inventory(force=True)
         elif kind == "end_of_round":
             print(f"[{self.venue}] segment ended", flush=True)
 
     async def maybe_request_inventory(self) -> None:
+        await self.request_inventory(force=False)
+
+    async def request_inventory(self, force: bool = False) -> None:
         now = time.monotonic()
-        if now - self.last_inventory_request < 1.0:
+        if not force and now - self.last_inventory_request < 1.0:
             return
         self.last_inventory_request = now
         await self.send({"type": "get_inventory", "user_request_id": self.next_id("inv")})
 
     def apply_inventory(self, data: Dict[str, List[int]]) -> None:
         account = self.engine.accounts[self.venue]
+        prefix = f"{self.venue}-"
+        for key in list(account.positions.keys()):
+            if key.startswith(prefix):
+                del account.positions[key]
         for key, pair in data.items():
             if not isinstance(pair, list) or len(pair) != 2:
                 continue
@@ -665,6 +778,7 @@ class ExchangeClient:
                 account.cash = total
             else:
                 account.positions[key] = total
+        self.inventory_ready = True
 
     async def fire(self) -> None:
         await self.engine.fire_live(self.server_time)
