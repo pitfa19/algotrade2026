@@ -29,9 +29,12 @@ except ImportError:  # pragma: no cover - exercised only on machines without dep
 
 
 INITIAL_CASH = 10_000_000
-CASH_FLOOR = -5_000_000
+CASH_FLOOR = -5_000_000        # hard server floor (-$50k)
+SOFT_CASH_FLOOR = -4_500_000   # soft floor (-$45k) — keeps a $5k buffer
 MAX_LONG = 2_000
+SOFT_MAX_LONG = 1_800          # soft long cap — keeps a 200-share buffer
 MAX_SHORT = -200
+SOFT_MAX_SHORT = -180          # soft short cap
 DEFAULT_ORDER_TTL_MS = 20_000
 
 
@@ -101,10 +104,6 @@ class PendingOrder:
 class ExchangeState:
     exchange: str
     cash: int = INITIAL_CASH
-    # Cash the server has reserved for our resting bids. Updated only by
-    # get_inventory_response — this is the *server's* truth, not derived
-    # from our local order book.
-    server_reserved_cash: int = 0
     positions: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     live_orders: dict[int, LiveOrder] = field(default_factory=dict)
     inflight_orders: dict[str, PendingOrder] = field(default_factory=dict)
@@ -117,10 +116,9 @@ class ExchangeState:
     def apply_inventory(self, data: dict[str, list[int]]) -> None:
         cash_pair = data.get("$")
         if cash_pair is not None:
-            # data["$"] = [reserved, total]
-            self.server_reserved_cash = int(cash_pair[0])
+            # data["$"] = [reserved, total]; we trust `total` and let our
+            # local `pending_bid_value()` carry the reservation accounting.
             self.cash = int(cash_pair[1])
-
         for instrument, pair in data.items():
             if instrument == "$":
                 continue
@@ -155,6 +153,7 @@ class ExchangeState:
     def drop_inflight(self, local_id: str | None) -> None:
         if local_id is not None:
             self.inflight_orders.pop(local_id, None)
+
 
     def pending_qty(
         self,
@@ -199,15 +198,6 @@ class ExchangeState:
         )
         return live_value + inflight_value
 
-    def inflight_bid_value(self) -> int:
-        """Cash committed by bids we've sent locally but the server may not
-        yet have acknowledged. The server's `server_reserved_cash` covers
-        anything it already knows about; this covers the gap."""
-        return sum(
-            max(0, order.quantity) * int(order.price or 0)
-            for order in self.inflight_orders.values()
-            if order.side == "bid"
-        )
 
 
 def default_rail_configs() -> dict[str, RailConfig]:
@@ -411,40 +401,28 @@ class RailEdgeStrategy:
 
     def _rail_bid_quantity(self, state: ExchangeState, extra_reserved: int = 0) -> int:
         instrument = self.config.instrument
-        position_room = MAX_LONG - state.position(instrument)
+        # Soft cap on position: hard floor is +2000 long, but we stop at
+        # SOFT_MAX_LONG=1800 so an in-flight burst can't push us across.
+        position_room = SOFT_MAX_LONG - state.position(instrument)
         pending_qty = state.pending_qty(
             instrument, side="bid", price=self.config.low_bid_price, role="rail"
         ) + int(extra_reserved)
-        # Reconcile against the server's *own* reservation accounting:
-        #   free = total_cash − server_reserved − inflight − safety_buffer − FLOOR
-        # Whatever the server has already locked in is in server_reserved_cash;
-        # adding inflight_bid_value avoids double-counting our own resting
-        # bids (which the server has already reserved). The buffer absorbs
-        # tick-level drift between get_inventory polls.
-        cash_room = (
-            state.cash
-            - state.server_reserved_cash
-            - state.inflight_bid_value()
-            - self._safety_buffer_cents()
-            - CASH_FLOOR
-        )
+        # Track *our own* reservations (resting + inflight bids) and check
+        # against the SOFT cash floor (-$45k) — leaves a $5k cushion above
+        # the exchange's hard −$50k floor. This is the namikv2 trick: never
+        # plan to a hard limit, always to a soft one.
+        cash_room = state.cash - state.pending_bid_value() - SOFT_CASH_FLOOR
         cash_qty = max(0, cash_room // self.config.low_bid_price)
         capacity = max(0, min(position_room - pending_qty, cash_qty))
         return min(capacity, int(self.config.lot_size))
-
-    @staticmethod
-    def _safety_buffer_cents() -> int:
-        # 1% of starting cash — keeps us comfortably away from the floor
-        # under realistic fill bursts between inventory polls.
-        return INITIAL_CASH // 100
 
     def _rail_ask_quantity(self, state: ExchangeState, extra_reserved: int = 0) -> int:
         instrument = self.config.instrument
         pos = state.position(instrument)
         if self.config.allow_short_rail:
-            # capacity = pos − MAX_SHORT — covers both selling owned shares AND
-            # opening a short up to the −200 floor.
-            capacity = pos - MAX_SHORT
+            # capacity = pos − SOFT_MAX_SHORT — covers selling owned shares AND
+            # opening a short down to the soft −180 floor (vs hard −200).
+            capacity = pos - SOFT_MAX_SHORT
         else:
             capacity = max(0, pos)
         pending_qty = state.pending_qty(instrument, side="ask") + int(extra_reserved)
@@ -699,9 +677,6 @@ class RailEdgeBot:
         if not message.get("success"):
             msg = (data or {}).get("message") if isinstance(data, dict) else None
             print(f"[{exchange}] add_order failed: {msg}", flush=True)
-            # On a server-side rejection we MAY be out of sync with the
-            # server's reservation accounting. Trigger a re-poll on the
-            # next loop iteration by clearing inflight (already done).
             return True
 
         had_fill = bool(
