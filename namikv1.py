@@ -58,13 +58,13 @@ except ImportError:
 # Universe (unchanged from v1)
 # ════════════════════════════════════════════════════════════════════════════
 
-VENUES = ["NYSE", "NASDAQ", "SSE", "JPX", "EURONEXT", "LSE", "HKEX", "NSE", "TMX", "ZSE"]
+VENUES = ["NYSE", "NASDAQ", "SSE", "JPX", "Euronext", "LSE", "HKEX", "NSE", "TMX", "ZSE"]
 WS_HOSTS = {
     "NYSE":     "nyse.algotrade.hr",
     "NASDAQ":   "nasdaq.algotrade.hr",
     "SSE":      "sse.algotrade.hr",
     "JPX":      "jpx.algotrade.hr",
-    "EURONEXT": "euronext.algotrade.hr",
+    "Euronext": "euronext.algotrade.hr",
     "LSE":      "lse.algotrade.hr",
     "HKEX":     "hkex.algotrade.hr",
     "NSE":      "nse.algotrade.hr",
@@ -76,7 +76,7 @@ WS_HOSTS = {
 # Within-cluster RTT is small; across is 80-180ms, which costs us drift.
 CLUSTERS = {
     "NA":   {"NYSE", "NASDAQ", "TMX"},
-    "EU":   {"LSE", "EURONEXT"},
+    "EU":   {"LSE", "Euronext"},
     "ASIA": {"JPX", "HKEX", "SSE"},
     "IN":   {"NSE"},
     "ZSE":  {"ZSE"},
@@ -84,31 +84,31 @@ CLUSTERS = {
 CLUSTER_OF = {v: c for c, vs in CLUSTERS.items() for v in vs}
 
 LISTINGS: dict[str, set[str]] = {
-    "CARD":  {"NYSE","NASDAQ","LSE","EURONEXT","JPX","SSE","HKEX","NSE","TMX","ZSE"},
-    "SIMP":  {"NYSE","NASDAQ","LSE","EURONEXT","JPX","SSE","HKEX","NSE","TMX","ZSE"},
-    "NGUP":  {"NYSE","NASDAQ","EURONEXT","TMX","ZSE"},
-    "OIT":   {"LSE","EURONEXT","HKEX","NSE","ZSE"},
+    "CARD":  {"NYSE","NASDAQ","LSE","Euronext","JPX","SSE","HKEX","NSE","TMX","ZSE"},
+    "SIMP":  {"NYSE","NASDAQ","LSE","Euronext","JPX","SSE","HKEX","NSE","TMX","ZSE"},
+    "NGUP":  {"NYSE","NASDAQ","Euronext","TMX","ZSE"},
+    "OIT":   {"LSE","Euronext","HKEX","NSE","ZSE"},
     "KTST":  {"NYSE","JPX","TMX","ZSE"},
     "FSR":   {"NASDAQ","LSE","SSE","HKEX","ZSE"},
-    "JZRO":  {"NYSE","LSE","EURONEXT","TMX","ZSE"},
+    "JZRO":  {"NYSE","LSE","Euronext","TMX","ZSE"},
     "XFR":   {"NYSE","HKEX","TMX","ZSE"},
-    "KOTD":  {"NASDAQ","LSE","EURONEXT","HKEX","ZSE"},
-    "INA":   {"NYSE","NASDAQ","EURONEXT","HKEX","ZSE"},
+    "KOTD":  {"NASDAQ","LSE","Euronext","HKEX","ZSE"},
+    "INA":   {"NYSE","NASDAQ","Euronext","HKEX","ZSE"},
     "HT":    {"NASDAQ","LSE","JPX","SSE","TMX","ZSE"},
-    "JNAF":  {"NYSE","EURONEXT","JPX","HKEX","ZSE"},
+    "JNAF":  {"NYSE","Euronext","JPX","HKEX","ZSE"},
     "DLKV":  {"NASDAQ","LSE","HKEX","NSE","ZSE"},
-    "DDJH":  {"NYSE","LSE","EURONEXT","TMX","ZSE"},
+    "DDJH":  {"NYSE","LSE","Euronext","TMX","ZSE"},
     "MDKA":  {"NYSE","LSE","HKEX","TMX","ZSE"},
-    "KRAS":  {"NYSE","EURONEXT","SSE","TMX","ZSE"},
-    "ZITO":  {"NASDAQ","LSE","EURONEXT","NSE","ZSE"},
+    "KRAS":  {"NYSE","Euronext","SSE","TMX","ZSE"},
+    "ZITO":  {"NASDAQ","LSE","Euronext","NSE","ZSE"},
     "ZABA":  {"NYSE","LSE","SSE","NSE","TMX","ZSE"},
-    "GOLD":  {"NASDAQ","EURONEXT","JPX","TMX","ZSE"},
-    "XAG":   {"LSE","EURONEXT","JPX","ZSE"},
-    "ETFA":  {"NYSE","EURONEXT","HKEX","ZSE"},
+    "GOLD":  {"NASDAQ","Euronext","JPX","TMX","ZSE"},
+    "XAG":   {"LSE","Euronext","JPX","ZSE"},
+    "ETFA":  {"NYSE","Euronext","HKEX","ZSE"},
     "ETFB":  {"NASDAQ","LSE","HKEX","ZSE"},
     "ETFA3": {"NYSE","TMX","ZSE"},
     "ETFB3": {"NASDAQ","HKEX","ZSE"},
-    "ETFSH": {"EURONEXT","JPX","ZSE"},
+    "ETFSH": {"Euronext","JPX","ZSE"},
 }
 ETF_BASKETS = {
     "ETFA":  ["NGUP", "OIT", "KTST", "FSR", "JZRO", "XFR"],
@@ -123,6 +123,14 @@ SUB_ETF_LINKS = {
     "ETFA": ("ETFA3", ["OIT", "FSR", "JZRO"]),
     "ETFB": ("ETFB3", ["HT",  "JNAF", "DDJH"]),
 }
+
+# Sector definitions for safe-haven momentum trading. Empirically Sector B
+# correlates -0.80 with GOLD at 10s horizon; Sector A correlates -0.34. The
+# combined market (avg of A+B) correlates -0.76. So sector returns are a
+# strong predictor of GOLD direction (XAG behaves OPPOSITELY — moves WITH the
+# market — so we trade GOLD only).
+SECTOR_A = ["NGUP", "OIT", "KTST", "FSR", "JZRO", "XFR"]
+SECTOR_B = ["KOTD", "INA", "HT", "JNAF", "DLKV", "DDJH"]
 
 # ════════════════════════════════════════════════════════════════════════════
 # Limits & knobs
@@ -159,6 +167,18 @@ TAPER_END_FRAC     =      0.95    # above 95% → essentially zero new orders
 
 # Depth walking — how many extra cents past best to consider in cross-venue.
 DEPTH_WALK_CENTS   =     20
+
+# Safe-haven momentum (directional GOLD trades vs sector momentum).
+# At 3-second horizon, market-vs-GOLD correlation is ~-0.60. We bet GOLD will
+# revert against any strong sector move. Unlike everything else in prism, this
+# is a DIRECTIONAL trade (no hedge); size accordingly small.
+SH_ENABLED         =   True
+SH_WINDOW_TICKS    =     30      # 3 seconds at 100ms cadence
+SH_TRIGGER_BPS     =     30.0    # min |sector return| over window to fire
+SH_EXPECTED_RECOVERY = 0.5       # bet GOLD recovers half the expected anti-move
+SH_MIN_EDGE_CENTS  =     10      # don't fire if expected move below this many cents
+SH_MAX_QTY         =     20      # cap per shot — small because directional
+SH_REFIRE_S        =      1.0    # minimum seconds between fires per direction
 
 ARB_MAX_K          =     25
 XV_MAX_QTY         =    100       # raised — depth walking lets us go bigger
@@ -321,6 +341,53 @@ class SpreadTracker:
 # Per-strategy P&L stats
 # ════════════════════════════════════════════════════════════════════════════
 
+class SectorMomentum:
+    """Tracks consensus mid for each ticker and computes rolling sector returns.
+
+    Updated on every market_data tick. The "consensus mid" is the cross-venue
+    average mid for each ticker (averaging out venue-specific dislocation).
+    Sector returns over a window are the input signal for safe-haven trades.
+    """
+    def __init__(self):
+        # Per-ticker rolling deque of (timestamp, consensus_mid). Window cap by
+        # count: SH_WINDOW_TICKS+1 entries to compute return-over-window.
+        self._mids: dict[str, deque[tuple[float, float]]] = {}
+
+    def update(self, hub: "Hub", ticker: str) -> None:
+        # Compute consensus mid across active venues for this ticker.
+        mids = []
+        for v in LISTINGS.get(ticker, set()):
+            if v not in hub.active_venues:
+                continue
+            bk = hub.books.get((v, ticker))
+            if bk is None:
+                continue
+            m = bk.mid
+            if m is not None:
+                mids.append(m)
+        if not mids:
+            return
+        consensus = sum(mids) / len(mids)
+        q = self._mids.setdefault(ticker, deque(maxlen=SH_WINDOW_TICKS + 2))
+        q.append((time.monotonic(), consensus))
+
+    def sector_return_bps(self, sector_tickers: list[str]) -> Optional[float]:
+        """Average return-over-window across sector members. None if insufficient data."""
+        rs = []
+        for tk in sector_tickers:
+            q = self._mids.get(tk)
+            if q is None or len(q) <= SH_WINDOW_TICKS:
+                continue
+            old = q[-1 - SH_WINDOW_TICKS][1]
+            new = q[-1][1]
+            if old <= 0:
+                continue
+            rs.append((new - old) / old * 10000.0)
+        if len(rs) < len(sector_tickers) // 2:
+            return None
+        return sum(rs) / len(rs)
+
+
 class StatsTracker:
     """Realized cash deltas attributed to each strategy that fired the leg."""
     def __init__(self):
@@ -457,10 +524,15 @@ class Hub:
         self.realized_cents = 0
         self.last_log = time.monotonic()
         self.last_mm_refresh: dict[tuple[str, str], float] = defaultdict(float)
+        # Per-venue activity counters — surface silent venues in the heartbeat
+        self.fills_by_venue: dict[str, int] = defaultdict(int)
+        self.realized_by_venue: dict[str, int] = defaultdict(int)
 
-        # NEW: adaptive thresholds + per-strategy stats
+        # NEW: adaptive thresholds + per-strategy stats + sector momentum
         self.spread_tracker = SpreadTracker()
         self.stats = StatsTracker()
+        self.sector_momentum = SectorMomentum()
+        self.sh_last_fire: dict[str, float] = defaultdict(float)  # per-direction throttle
 
     def req_id(self, tag: str) -> str:
         self._req_seq += 1
@@ -603,6 +675,7 @@ class Hub:
         t = msg.get("time")
         if isinstance(t, int):
             self.server_time[exchange] = t
+        updated_tickers: set[str] = set()
         for inst, depth in msg.get("orderbook_depths", {}).items():
             ex, _, tk = inst.partition("-")
             if ex != exchange:
@@ -610,6 +683,10 @@ class Hub:
             book = self.books.get((ex, tk))
             if book is not None:
                 book.update(depth)
+                updated_tickers.add(tk)
+        # Refresh sector-momentum consensus for each ticker that just changed.
+        for tk in updated_tickers:
+            self.sector_momentum.update(self, tk)
         for ev in msg.get("events", []) or []:
             if ev.get("event_type") != "trade":
                 continue
@@ -627,6 +704,8 @@ class Hub:
                 cash_delta = -fill_qty * fill_px if side == "bid" else fill_qty * fill_px
                 self.cash[ex] += cash_delta
                 self.fills_count += 1
+                self.fills_by_venue[ex] += 1
+                self.realized_by_venue[ex] += cash_delta
                 # Attribute the fill — these are usually MM resting orders.
                 self.stats.record_fill("MM", cash_delta)
                 rem = qty - fill_qty
@@ -652,9 +731,11 @@ class Hub:
         if ic is not None:
             self.pos[(leg.exchange, leg.ticker)] += int(ic)
             self.fills_count += 1
+            self.fills_by_venue[leg.exchange] += 1
         if bc is not None:
             self.cash[leg.exchange] += int(bc)
             self.realized_cents += int(bc)
+            self.realized_by_venue[leg.exchange] += int(bc)
             # Per-strategy attribution
             if leg.strategy:
                 self.stats.record_fill(leg.strategy, int(bc))
@@ -727,6 +808,7 @@ class Hub:
         plans += self.etf_basket_arbs()
         plans += self.sub_etf_arbs()
         plans += self.cross_venue_arbs()
+        plans += self.safe_haven_arbs()
         plans += self.settlement_unwind()
         for plan in plans:
             self.fire(plan)
@@ -749,6 +831,21 @@ class Hub:
                 self.fills_count, self.realized_cents / 100,
                 sum(self.open_count.values()), len(self.live_orders),
             )
+            # Per-venue activity. A silent venue (books=0/N or fills=0 long after start)
+            # is the canary for connection / casing / config bugs like the Euronext one.
+            venue_lines = []
+            for v in self.active_venues:
+                quoted = sum(1 for tk in self.tickers_on_ex[v]
+                             if self.books[(v, tk)].mid is not None)
+                listed = len(self.tickers_on_ex[v])
+                fills = self.fills_by_venue.get(v, 0)
+                realized = self.realized_by_venue.get(v, 0)
+                ready_mark = "" if self.ready.get(v) else " NOT-READY"
+                venue_lines.append(
+                    f"{v}: books={quoted}/{listed} fills={fills} "
+                    f"realized=${realized/100:+.0f}{ready_mark}"
+                )
+            log.info("[hb-venue] %s", " | ".join(venue_lines))
             summary = self.stats.summary()
             if summary:
                 log.info("[strat] %s", summary)
@@ -1085,6 +1182,82 @@ class Hub:
                 ))
         return out
 
+    # ─── strategy 4: safe-haven momentum (GOLD vs sector returns) ────
+    def safe_haven_arbs(self) -> list[Plan]:
+        """When sectors A+B move together, GOLD reverts in the opposite direction.
+
+        Empirically validated on data: market vs GOLD correlation ≈ -0.60 at 3s
+        horizon, -0.76 at 10s. We track sector returns over SH_WINDOW_TICKS
+        (3s) and fire a directional GOLD trade opposite to the dominant sector
+        signal. NOT hedged — directional bets only, sized small.
+
+        Note: XAG moves WITH the market (correlation +0.45), so we only trade
+        GOLD here. ETFSH = (GOLD+XAG)/2 has noise-level correlation with sectors
+        because the components cancel; ETFSH arb is left to ETF-NAV strategy.
+        """
+        if not SH_ENABLED:
+            return []
+        sa = self.sector_momentum.sector_return_bps(SECTOR_A)
+        sb = self.sector_momentum.sector_return_bps(SECTOR_B)
+        if sa is None or sb is None:
+            return []
+        # Combine: weighted toward Sector B since its anti-correlation is stronger
+        # (-0.80 vs -0.34 for Sector A at 10s).
+        signal_bps = 0.3 * sa + 0.7 * sb
+        if abs(signal_bps) < SH_TRIGGER_BPS:
+            return []
+
+        # Sector up → expect GOLD down → SELL GOLD.  Sector down → BUY GOLD.
+        gold_side = "ask" if signal_bps > 0 else "bid"
+        # Throttle by direction so we don't pile in every tick during a sustained move.
+        now = time.monotonic()
+        if now - self.sh_last_fire[gold_side] < SH_REFIRE_S:
+            return []
+
+        # Pick the venue with best price and freshness (use cluster preference: NA cluster
+        # for GOLD since it's listed there and is closest in latency for execution).
+        if gold_side == "bid":  # we're buying GOLD: want lowest ask
+            best = self._best_buy_venue("GOLD")
+        else:                   # selling GOLD: want highest bid
+            best = self._best_sell_venue("GOLD")
+        if best is None:
+            return []
+        ex, px, qty_avail = best
+        bk = self.books[(ex, "GOLD")]
+        if bk.mid is None:
+            return []
+
+        # Expected GOLD move in cents = SH_EXPECTED_RECOVERY * |signal| / 10000 * mid
+        expected_recovery_bps = SH_EXPECTED_RECOVERY * abs(signal_bps)
+        expected_move_cents = expected_recovery_bps / 10000.0 * bk.mid
+        if expected_move_cents < SH_MIN_EDGE_CENTS:
+            return []
+
+        qty = min(qty_avail, SH_MAX_QTY)
+        # Inventory taper applied normally
+        taper = self.inventory_taper(ex, "GOLD", gold_side)
+        qty = max(0, int(qty * taper))
+        if qty <= 0:
+            return []
+
+        # Position headroom
+        if gold_side == "bid":
+            qty = min(qty, SOFT_POS_MAX - self.pos[(ex, "GOLD")])
+            if px > 0:
+                qty = min(qty, (self.cash[ex] - SOFT_CASH_FLOOR) // px)
+        else:
+            qty = min(qty, self.pos[(ex, "GOLD")] - SOFT_POS_MIN)
+        if qty <= 0:
+            return []
+
+        self.sh_last_fire[gold_side] = now
+        return [Plan(
+            [Leg(ex, "GOLD", gold_side, qty, px,
+                 note=f"sh_{gold_side}_GOLD")],
+            edge_cents=expected_move_cents,
+            strategy=f"SAFE-HAVEN GOLD {gold_side} (signal={signal_bps:+.0f}bps)",
+        )]
+
     # ─── strategy 5: settlement-aware unwind (unchanged) ─────────────
     def settlement_unwind(self) -> list[Plan]:
         out: list[Plan] = []
@@ -1340,10 +1513,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    active = [v.strip().upper() for v in args.venues.split(",") if v.strip()]
-    bad = [v for v in active if v not in VENUES]
-    if bad:
-        raise SystemExit(f"unknown venue(s): {bad} (valid: {VENUES})")
+    # Case-insensitive matching but canonicalize to the casing used by the server
+    venue_canon = {v.upper(): v for v in VENUES}
+    active = []
+    for v in args.venues.split(","):
+        v = v.strip()
+        if not v:
+            continue
+        canon = venue_canon.get(v.upper())
+        if canon is None:
+            raise SystemExit(f"unknown venue: {v!r} (valid: {VENUES})")
+        if canon not in active:
+            active.append(canon)
     log.info("starting prism2 on venues: %s", active)
     try:
         asyncio.run(amain(active))

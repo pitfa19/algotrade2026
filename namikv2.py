@@ -160,6 +160,13 @@ TAPER_END_FRAC     =      0.95    # above 95% → essentially zero new orders
 # Depth walking — how many extra cents past best to consider in cross-venue.
 DEPTH_WALK_CENTS   =     20
 
+# Per-leg drift cost when the leg's venue is outside our latency cluster.
+# Round-trip is ~80-180ms across clusters; a typical 1¢/100ms drift gets
+# eaten by the slower fill. Add this many cents to the XV threshold per
+# out-of-cluster leg, so arb that's only "free" near NYSE doesn't fire
+# blindly when we're rotated to HKEX.
+CROSS_CLUSTER_DRIFT_CENTS = 3
+
 ARB_MAX_K          =     25
 XV_MAX_QTY         =    100       # raised — depth walking lets us go bigger
 MM_INSIDE_TICK     =      1
@@ -421,8 +428,9 @@ class Plan:
 # ════════════════════════════════════════════════════════════════════════════
 
 class Hub:
-    def __init__(self, active_venues: list[str]):
+    def __init__(self, active_venues: list[str], my_cluster: str = "NA"):
         self.active_venues = active_venues
+        self.my_cluster = my_cluster
         self.stop = False
         self.connections: dict[str, "Connection"] = {}
 
@@ -578,8 +586,19 @@ class Hub:
         return True
 
     # ─── message handlers (mostly unchanged; trade event paths preserved) ─
-    def on_welcome(self, exchange: str) -> None:
+    def on_welcome(self, exchange: str, msg: Optional[dict] = None) -> None:
         log.info("welcome %s", exchange)
+        if msg is not None:
+            # Welcome carries the actual segment length and server clock — pick
+            # them up so settlement_unwind doesn't run on the DEFAULT_ROUND_MS
+            # placeholder. Earlier versions parsed the welcome but threw the
+            # data away.
+            rl = msg.get("round_length")
+            if isinstance(rl, int) and rl > 0:
+                self.round_length[exchange] = rl
+            t = msg.get("time")
+            if isinstance(t, int):
+                self.server_time[exchange] = t
         self.ready[exchange] = False
         for tk in self.tickers_on_ex.get(exchange, set()):
             self.pos[(exchange, tk)] = 0
@@ -822,8 +841,8 @@ class Hub:
             const_ask: dict[str, tuple[str, int, int]] = {}
             ok = True
             for tk in basket:
-                bb = self._best_sell_venue(tk)
-                ba = self._best_buy_venue(tk)
+                bb = self._best_sell_venue(tk, self.my_cluster)
+                ba = self._best_buy_venue(tk, self.my_cluster)
                 if bb is None or ba is None:
                     ok = False; break
                 const_bid[tk] = bb
@@ -926,8 +945,8 @@ class Hub:
             comp_ask: dict[str, tuple[str, int, int]] = {}
             ok = True
             for tk in complement:
-                bb = self._best_sell_venue(tk)
-                ba = self._best_buy_venue(tk)
+                bb = self._best_sell_venue(tk, self.my_cluster)
+                ba = self._best_buy_venue(tk, self.my_cluster)
                 if bb is None or ba is None:
                     ok = False; break
                 comp_bid[tk] = bb
@@ -936,15 +955,23 @@ class Hub:
                 continue
 
             def best_quote(tk, venues, side):
-                best = None
+                # Tie-break on cluster preference, same as _best_*_venue.
+                my_cluster = self.my_cluster
+                best = None  # (v, px, qty, in_cluster_flag)
                 for v in venues:
                     bk = self.books[(v, tk)]
                     px = bk.best_ask if side == "bid" else bk.best_bid
                     qty = bk.best_ask_qty if side == "bid" else bk.best_bid_qty
                     if px is None: continue
-                    if best is None or (px < best[1] if side == "bid" else px > best[1]):
-                        best = (v, px, qty)
-                return best
+                    in_cluster = 0 if CLUSTER_OF.get(v) == my_cluster else 1
+                    if best is None:
+                        best = (v, px, qty, in_cluster)
+                        continue
+                    cmp_self = (px, in_cluster) if side == "bid" else (-px, in_cluster)
+                    cmp_best = (best[1], best[3]) if side == "bid" else (-best[1], best[3])
+                    if cmp_self < cmp_best:
+                        best = (v, px, qty, in_cluster)
+                return best[:3] if best else None
 
             sup_buy = best_quote(super_etf, sup_venues, "bid")
             sup_sell = best_quote(super_etf, sup_venues, "ask")
@@ -953,8 +980,11 @@ class Hub:
             if not (sup_buy and sup_sell and sub_buy and sub_sell):
                 continue
 
-            # Direction A: super cheap → long super, short sub + complement
-            edge_a = 3*sub_buy[1] + sum(comp_bid[tk][1] for tk in complement) - 6*sup_buy[1]
+            # Direction A: super cheap → long super, short sub + complement.
+            # Selling sub: hit the BID, which is sub_sell[1] (best_quote(side="ask")
+            # returns best_bid). Earlier code used sub_buy[1] (the ASK) and emitted
+            # sell IOCs at limit=ASK that never filled — fixed.
+            edge_a = 3*sub_sell[1] + sum(comp_bid[tk][1] for tk in complement) - 6*sup_buy[1]
             edge_a_per_share = edge_a / 6
             if edge_a > 0:
                 self.spread_tracker.record("SUB_ETF_A", super_etf, edge_a_per_share)
@@ -962,10 +992,10 @@ class Hub:
             if edge_a_per_share >= thr:
                 taper = self.inventory_taper(sup_buy[0], super_etf, "bid")
                 k = min(
-                    sup_buy[2] // 6, sub_buy[2] // 3,
+                    sup_buy[2] // 6, sub_sell[2] // 3,
                     *(comp_bid[tk][2] for tk in complement),
                     (SOFT_POS_MAX - self.pos[(sup_buy[0], super_etf)]) // 6,
-                    (self.pos[(sub_buy[0], sub_etf)] - SOFT_POS_MIN) // 3,
+                    (self.pos[(sub_sell[0], sub_etf)] - SOFT_POS_MIN) // 3,
                     *((self.pos[(comp_bid[tk][0], tk)] - SOFT_POS_MIN) for tk in complement),
                     (self.cash[sup_buy[0]] - SOFT_CASH_FLOOR) // (6 * sup_buy[1]) if sup_buy[1] else 0,
                     ARB_MAX_K,
@@ -974,7 +1004,7 @@ class Hub:
                 if k > 0:
                     legs = [
                         Leg(sup_buy[0], super_etf, "bid", 6*k, sup_buy[1], note=f"sub_long_{super_etf}"),
-                        Leg(sub_buy[0], sub_etf,   "ask", 3*k, sub_buy[1], note=f"sub_short_{sub_etf}"),
+                        Leg(sub_sell[0], sub_etf,  "ask", 3*k, sub_sell[1], note=f"sub_short_{sub_etf}"),
                     ]
                     for tk in complement:
                         v, px, _ = comp_bid[tk]
@@ -982,8 +1012,11 @@ class Hub:
                     out.append(Plan(legs, edge_cents=edge_a_per_share,
                                     strategy=f"SUB-ETF {super_etf}/{sub_etf} long"))
 
-            # Direction B: super rich
-            edge_b = 6*sup_sell[1] - 3*sub_sell[1] - sum(comp_ask[tk][1] for tk in complement)
+            # Direction B: super rich → sell super, buy sub + complement.
+            # Buying sub: pay the ASK, which is sub_buy[1]. Earlier code used
+            # sub_sell[1] (the BID) and emitted buy IOCs at limit=BID that never
+            # filled — fixed.
+            edge_b = 6*sup_sell[1] - 3*sub_buy[1] - sum(comp_ask[tk][1] for tk in complement)
             edge_b_per_share = edge_b / 6
             if edge_b > 0:
                 self.spread_tracker.record("SUB_ETF_B", super_etf, edge_b_per_share)
@@ -991,7 +1024,7 @@ class Hub:
             if edge_b_per_share >= thr:
                 taper = self.inventory_taper(sup_sell[0], super_etf, "ask")
                 buys_per_k_per_venue: dict[str, int] = defaultdict(int)
-                buys_per_k_per_venue[sub_sell[0]] += 3 * sub_sell[1]
+                buys_per_k_per_venue[sub_buy[0]] += 3 * sub_buy[1]
                 for tk in complement:
                     v, px, _ = comp_ask[tk]
                     buys_per_k_per_venue[v] += px
@@ -1000,10 +1033,10 @@ class Hub:
                     if per_k_cost > 0:
                         cash_k = min(cash_k, (self.cash[v] - SOFT_CASH_FLOOR) // per_k_cost)
                 k = min(
-                    sup_sell[2] // 6, sub_sell[2] // 3,
+                    sup_sell[2] // 6, sub_buy[2] // 3,
                     *(comp_ask[tk][2] for tk in complement),
                     (self.pos[(sup_sell[0], super_etf)] - SOFT_POS_MIN) // 6,
-                    (SOFT_POS_MAX - self.pos[(sub_sell[0], sub_etf)]) // 3,
+                    (SOFT_POS_MAX - self.pos[(sub_buy[0], sub_etf)]) // 3,
                     *((SOFT_POS_MAX - self.pos[(comp_ask[tk][0], tk)]) for tk in complement),
                     cash_k, ARB_MAX_K,
                 )
@@ -1011,7 +1044,7 @@ class Hub:
                 if k > 0:
                     legs = [
                         Leg(sup_sell[0], super_etf, "ask", 6*k, sup_sell[1], note=f"sub_short_{super_etf}"),
-                        Leg(sub_sell[0], sub_etf,   "bid", 3*k, sub_sell[1], note=f"sub_long_{sub_etf}"),
+                        Leg(sub_buy[0], sub_etf,    "bid", 3*k, sub_buy[1],  note=f"sub_long_{sub_etf}"),
                     ]
                     for tk in complement:
                         v, px, _ = comp_ask[tk]
@@ -1049,12 +1082,23 @@ class Hub:
             self.spread_tracker.record("XV", tk, top_edge)
             threshold = self.spread_tracker.threshold("XV", tk, BASE_XV_EDGE)
 
-            if top_edge < threshold:
+            # Drift-aware threshold: each leg outside our cluster eats expected
+            # cents of drift between signal and fill. The bot's location rotates
+            # each segment, so the same XV pair has a different effective bar
+            # in NA vs ASIA.
+            buy_v, buy_px_top, _ = best_a
+            sell_v, sell_px_top, _ = best_b
+            drift = 0
+            if CLUSTER_OF.get(buy_v) != self.my_cluster:
+                drift += CROSS_CLUSTER_DRIFT_CENTS
+            if CLUSTER_OF.get(sell_v) != self.my_cluster:
+                drift += CROSS_CLUSTER_DRIFT_CENTS
+            effective_threshold = threshold + drift
+
+            if top_edge < effective_threshold:
                 continue
 
             # Depth walk: find total qty available within DEPTH_WALK_CENTS of best
-            buy_v, buy_px_top, _ = best_a
-            sell_v, sell_px_top, _ = best_b
             buy_book = self.books[(buy_v, tk)]
             sell_book = self.books[(sell_v, tk)]
 
@@ -1063,7 +1107,7 @@ class Hub:
             buy_qty, buy_avg = buy_book.buy_depth_to(buy_limit)
             sell_qty, sell_avg = sell_book.sell_depth_to(sell_limit)
             walked = False
-            if buy_avg is not None and sell_avg is not None and (sell_avg - buy_avg) >= threshold:
+            if buy_avg is not None and sell_avg is not None and (sell_avg - buy_avg) >= effective_threshold:
                 buy_px = buy_limit
                 sell_px = sell_limit
                 walked = True
@@ -1166,9 +1210,12 @@ class Hub:
                     continue
                 pos = self.pos[key]
 
-                # NEW: microprice-aware skew. If microprice > mid, market is buying;
-                # quote slightly higher on both sides (hit our ask less, fill bid less,
-                # but at better prices on the bid).
+                # Microprice-aware skew. If microprice > mid → buying pressure,
+                # the next print likely lifts; shift BOTH our quotes upward so
+                # we sell into the lift at a better price and reload our bid
+                # closer to where the market is heading. Earlier code only
+                # moved one side per direction, which made us chase the move
+                # rather than capture it.
                 mp = bk.microprice
                 m = bk.mid
                 skew = 0
@@ -1178,8 +1225,8 @@ class Hub:
                     elif mp < m - 1:  # selling pressure
                         skew = -1
 
-                bid_px = bb + MM_INSIDE_TICK + max(0, skew)
-                ask_px = ba - MM_INSIDE_TICK + min(0, skew)
+                bid_px = bb + MM_INSIDE_TICK + skew
+                ask_px = ba - MM_INSIDE_TICK + skew
                 if bid_px >= ask_px:
                     continue
 
@@ -1253,7 +1300,7 @@ class Connection:
                     welcome = json.loads(raw)
                     if welcome.get("type") != "welcome":
                         log.warning("%s unexpected first msg: %s", self.exchange, welcome)
-                    self.hub.on_welcome(self.exchange)
+                    self.hub.on_welcome(self.exchange, welcome)
                     sender = asyncio.create_task(self._sender_loop(ws), name=f"snd-{self.exchange}")
                     try:
                         await self._receiver_loop(ws)
@@ -1318,8 +1365,47 @@ class Connection:
 # Main
 # ════════════════════════════════════════════════════════════════════════════
 
-async def amain(active_venues: list[str]) -> None:
-    hub = Hub(active_venues)
+async def auto_detect_cluster() -> str:
+    """Probe each venue's :9001 in parallel and return the cluster of the
+    fastest responder. Team VM rotates location each segment, so this needs
+    to run at startup of every segment, not once globally.
+
+    Falls back to NA if every venue is unreachable (likely between rounds —
+    docs say WS ports are filtered when no round is live).
+    """
+    async def probe(venue: str):
+        host = WS_HOSTS[venue]
+        t0 = time.monotonic()
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, 9001), timeout=2.0
+            )
+            elapsed = time.monotonic() - t0
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return elapsed
+        except Exception:
+            return None
+
+    log.info("auto-detect: probing venue latencies...")
+    rtts = await asyncio.gather(*(probe(v) for v in VENUES))
+    pairs = [(v, r) for v, r in zip(VENUES, rtts) if r is not None]
+    if not pairs:
+        log.warning("auto-detect: no venues reachable (between rounds?), defaulting to NA")
+        return "NA"
+    pairs.sort(key=lambda x: x[1])
+    fastest_v, fastest_rtt = pairs[0]
+    cluster = CLUSTER_OF.get(fastest_v, "NA")
+    log.info("auto-detect: fastest=%s (%.1fms) → cluster=%s",
+             fastest_v, fastest_rtt * 1000, cluster)
+    log.info("auto-detect rtts: %s",
+             ", ".join(f"{v}={r*1000:.0f}ms" for v, r in pairs))
+    return cluster
+
+
+async def amain(active_venues: list[str], my_cluster: str) -> None:
+    hub = Hub(active_venues, my_cluster)
     for ex in active_venues:
         hub.connections[ex] = Connection(hub, ex)
 
@@ -1357,6 +1443,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--venues", default=",".join(VENUES),
                    help="Comma-separated venue subset")
+    p.add_argument("--location", default="auto",
+                   choices=["auto", "NA", "EU", "ASIA", "IN", "ZSE"],
+                   help="Latency cluster the bot is running from. "
+                        "'auto' probes venues at startup and picks the lowest-RTT cluster. "
+                        "Override when probing is unreliable (between rounds, debugging).")
     return p.parse_args()
 
 
@@ -1375,8 +1466,17 @@ def main() -> None:
         if canon not in active:
             active.append(canon)
     log.info("starting prism2 on venues: %s", active)
+
+    async def run() -> None:
+        if args.location == "auto":
+            my_cluster = await auto_detect_cluster()
+        else:
+            my_cluster = args.location
+            log.info("location override: cluster=%s", my_cluster)
+        await amain(active, my_cluster)
+
     try:
-        asyncio.run(amain(active))
+        asyncio.run(run())
     except KeyboardInterrupt:
         pass
 
