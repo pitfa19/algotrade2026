@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AlgoTrade 2026 — Self Dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --bg: #0b0e13;
+    --panel: #141823;
+    --panel2: #1b2030;
+    --border: #232a3b;
+    --text: #d8dde7;
+    --muted: #8893a8;
+    --green: #4ade80;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --blue: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 13px; }
+  a { color: var(--blue); }
+  header { padding: 12px 20px; border-bottom: 1px solid var(--border); display: flex;
+    align-items: center; gap: 24px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: 0.5px; }
+  .totals { display: flex; gap: 24px; flex-wrap: wrap; }
+  .total { display: flex; flex-direction: column; }
+  .total .label { color: var(--muted); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.6px; }
+  .total .value { font-size: 18px; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  .neut { color: var(--text); }
+  .small { color: var(--muted); font-size: 11px; }
+  main { padding: 16px 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; }
+  .card h2 { margin: 0 0 10px 0; font-size: 13px; font-weight: 600;
+    letter-spacing: 0.4px; text-transform: uppercase; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 4px 6px; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase;
+    border-bottom: 1px solid var(--border); }
+  tr:hover td { background: var(--panel2); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--red); margin-right: 6px; vertical-align: middle; }
+  .dot.on { background: var(--green); }
+  select, input { background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; }
+  .ob-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .ob-side th { color: var(--muted); }
+  .ob-bid td:nth-child(2) { color: var(--green); }
+  .ob-ask td:nth-child(2) { color: var(--red); }
+  .events { font-size: 12px; max-height: 280px; overflow-y: auto; }
+  .events div { padding: 2px 0; border-bottom: 1px dashed var(--border);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; }
+  .err { color: var(--red); font-size: 11px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
+    background: var(--panel2); color: var(--muted); }
+  .full { grid-column: 1 / -1; }
+  .footer { padding: 8px 20px; border-top: 1px solid var(--border); color: var(--muted);
+    font-size: 11px; display: flex; gap: 16px; justify-content: space-between; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ALGOTRADE 2026 · self dashboard</h1>
+  <div class="totals" id="totals"></div>
+  <div style="margin-left:auto" class="small" id="updated">—</div>
+</header>
+
+<main>
+  <section class="card full">
+    <h2>Per-exchange summary</h2>
+    <table id="ex-table">
+      <thead>
+        <tr>
+          <th>Exchange</th><th>Status</th><th>Cash $</th><th>NAV $</th>
+          <th>PnL $</th><th>Open positions</th><th>Pending orders</th>
+          <th>Segment t-rem</th><th>Last msg</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Positions (non-zero)</h2>
+    <table id="pos-table">
+      <thead>
+        <tr>
+          <th>Exchange</th><th>Instrument</th><th>Qty</th><th>Reserved</th>
+          <th>Mid $</th><th>Value $</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Order book</h2>
+    <div class="row" style="margin-bottom:10px">
+      <select id="ob-ex"></select>
+      <select id="ob-inst"></select>
+      <span class="pill" id="ob-mid">mid: —</span>
+      <span class="pill" id="ob-last">last: —</span>
+    </div>
+    <div class="ob-grid">
+      <div class="ob-side">
+        <table class="ob-bid">
+          <thead><tr><th>Bid Price $</th><th>Qty</th></tr></thead>
+          <tbody id="ob-bids"></tbody>
+        </table>
+      </div>
+      <div class="ob-side">
+        <table class="ob-ask">
+          <thead><tr><th>Ask Price $</th><th>Qty</th></tr></thead>
+          <tbody id="ob-asks"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="card full">
+    <h2>Recent events</h2>
+    <div class="row" style="margin-bottom:6px">
+      <label class="small">Exchange:</label>
+      <select id="ev-ex"></select>
+      <label class="small">Filter:</label>
+      <input id="ev-filter" placeholder="instrument substring" />
+    </div>
+    <div class="events" id="events"></div>
+  </section>
+</main>
+
+<div class="footer">
+  <div>
+    No public leaderboard API exists at AlgoTrade — trade events are anonymous.
+    The "PnL" shown here is your own NAV minus initial $100k × 10 exchanges,
+    which is what the official scoring formula is computed from.
+  </div>
+  <div>poll: 1s · /api/state</div>
+</div>
+
+<script>
+const fmtCents = c => (c == null) ? "—" : (c / 100).toLocaleString(undefined, {
+  minimumFractionDigits: 2, maximumFractionDigits: 2,
+});
+const fmtSignedCents = c => {
+  if (c == null) return "—";
+  const s = (c / 100).toLocaleString(undefined, {
+    minimumFractionDigits: 2, maximumFractionDigits: 2,
+  });
+  return c > 0 ? "+" + s : s;
+};
+const klass = c => (c == null || c === 0) ? "neut" : (c > 0 ? "pos" : "neg");
+const fmtMs = ms => {
+  if (ms == null) return "—";
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2,"0")}`;
+};
+
+let lastSnap = null;
+let selectedObEx = "zse", selectedObInst = null;
+let selectedEvEx = "all", evFilter = "";
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/state");
+    const s = await r.json();
+    lastSnap = s;
+    render(s);
+    document.getElementById("updated").textContent =
+      "updated " + new Date(s.ts_ms).toLocaleTimeString();
+  } catch (e) {
+    document.getElementById("updated").textContent = "fetch failed: " + e;
+  }
+}
+
+function render(s) {
+  const t = s.totals;
+  const totalsEl = document.getElementById("totals");
+  totalsEl.innerHTML = `
+    <div class="total">
+      <span class="label">Total NAV</span>
+      <span class="value">$${fmtCents(t.nav_cents)}</span>
+    </div>
+    <div class="total">
+      <span class="label">Total PnL</span>
+      <span class="value ${klass(t.pnl_cents)}">$${fmtSignedCents(t.pnl_cents)}</span>
+    </div>
+    <div class="total">
+      <span class="label">Cash</span>
+      <span class="value">$${fmtCents(t.cash_cents)}</span>
+    </div>
+    <div class="total">
+      <span class="label">Connected</span>
+      <span class="value">${t.connected}/${t.exchange_count}</span>
+    </div>
+  `;
+
+  const tbody = document.querySelector("#ex-table tbody");
+  tbody.innerHTML = s.exchanges.map(e => {
+    const posCount = e.positions.length;
+    const lastMsg = e.last_msg_age_sec == null ? "—" :
+      e.last_msg_age_sec.toFixed(1) + "s";
+    const status = `<span class="dot ${e.connected ? "on" : ""}"></span>` +
+      (e.connected ? "live" : (e.error ? "<span class='err' title='"+escapeHtml(e.error)+"'>down</span>" : "—"));
+    return `<tr>
+      <td><strong>${e.name.toUpperCase()}</strong></td>
+      <td>${status}</td>
+      <td>${fmtCents(e.cash_cents)}</td>
+      <td>${fmtCents(e.nav_cents)}</td>
+      <td class="${klass(e.pnl_cents)}">${fmtSignedCents(e.pnl_cents)}</td>
+      <td>${posCount}</td>
+      <td>${e.pending_orders_count}</td>
+      <td>${fmtMs(e.time_remaining_ms)}</td>
+      <td>${lastMsg}</td>
+    </tr>`;
+  }).join("");
+
+  const posBody = document.querySelector("#pos-table tbody");
+  const allPos = [];
+  s.exchanges.forEach(e => e.positions.forEach(p => allPos.push({...p, ex: e.name})));
+  if (!allPos.length) {
+    posBody.innerHTML = `<tr><td colspan="6" class="small">no positions</td></tr>`;
+  } else {
+    posBody.innerHTML = allPos
+      .sort((a,b) => Math.abs(b.value_cents) - Math.abs(a.value_cents))
+      .map(p => `<tr>
+        <td>${p.ex.toUpperCase()}</td>
+        <td>${p.instrument}</td>
+        <td class="${klass(p.qty)}">${p.qty}</td>
+        <td>${p.reserved}</td>
+        <td>${fmtCents(p.mid_cents)}</td>
+        <td class="${klass(p.value_cents)}">${fmtCents(p.value_cents)}</td>
+      </tr>`).join("");
+  }
+
+  // exchange selectors
+  const obEx = document.getElementById("ob-ex");
+  const evEx = document.getElementById("ev-ex");
+  if (obEx.options.length === 0) {
+    s.exchanges.forEach(e => {
+      const opt = document.createElement("option");
+      opt.value = e.name;
+      opt.textContent = e.name.toUpperCase();
+      obEx.appendChild(opt);
+    });
+    obEx.value = selectedObEx;
+
+    const allOpt = document.createElement("option");
+    allOpt.value = "all"; allOpt.textContent = "ALL";
+    evEx.appendChild(allOpt);
+    s.exchanges.forEach(e => {
+      const opt = document.createElement("option");
+      opt.value = e.name;
+      opt.textContent = e.name.toUpperCase();
+      evEx.appendChild(opt);
+    });
+    evEx.value = selectedEvEx;
+  }
+
+  // instrument selector follows exchange
+  const obInst = document.getElementById("ob-inst");
+  const ex = s.exchanges.find(e => e.name === obEx.value);
+  const insts = ex ? ex.instruments_seen : [];
+  if (obInst.dataset.ex !== obEx.value) {
+    obInst.innerHTML = insts.map(i => `<option>${i}</option>`).join("");
+    obInst.dataset.ex = obEx.value;
+    if (insts.length) obInst.value = insts[0];
+  }
+  selectedObInst = obInst.value;
+
+  renderEvents();
+}
+
+async function refreshOrderbook() {
+  const ex = document.getElementById("ob-ex").value;
+  const inst = document.getElementById("ob-inst").value;
+  if (!ex || !inst) return;
+  try {
+    const r = await fetch(`/api/orderbook/${ex}/${encodeURIComponent(inst)}`);
+    if (!r.ok) return;
+    const d = await r.json();
+    document.getElementById("ob-bids").innerHTML = d.bids.slice(0, 10)
+      .map(([p, q]) => `<tr><td>${fmtCents(p)}</td><td>${q}</td></tr>`).join("")
+      || `<tr><td colspan="2" class="small">empty</td></tr>`;
+    document.getElementById("ob-asks").innerHTML = d.asks.slice(0, 10)
+      .map(([p, q]) => `<tr><td>${fmtCents(p)}</td><td>${q}</td></tr>`).join("")
+      || `<tr><td colspan="2" class="small">empty</td></tr>`;
+    document.getElementById("ob-mid").textContent = "mid: $" + fmtCents(d.mid_cents);
+    document.getElementById("ob-last").textContent = "last: $" + fmtCents(d.last_trade_cents);
+  } catch (e) { /* ignore */ }
+}
+
+function renderEvents() {
+  if (!lastSnap) return;
+  const exSel = document.getElementById("ev-ex").value;
+  const filter = document.getElementById("ev-filter").value.trim().toUpperCase();
+  const merged = [];
+  lastSnap.exchanges.forEach(e => {
+    if (exSel !== "all" && e.name !== exSel) return;
+    e.recent_events.forEach(ev => merged.push({ex: e.name, ...ev}));
+  });
+  // newest at top: events array is already chronological — reverse
+  merged.reverse();
+  const lines = merged.filter(ev => {
+    if (!filter) return true;
+    const inst = (ev.data && (ev.data.instrumentID || ev.data.instrument_id)) || "";
+    return inst.toUpperCase().includes(filter);
+  }).slice(0, 200).map(ev => {
+    const d = ev.data || {};
+    if (ev.event_type === "trade") {
+      return `<div>[${ev.ex.toUpperCase()}] TRADE ${d.instrumentID || ""} @ $${fmtCents(d.price)} × ${d.quantity}  t=${d.time}</div>`;
+    } else if (ev.event_type === "cancel") {
+      return `<div>[${ev.ex.toUpperCase()}] CANCEL ${d.instrumentID || ""} order=${d.orderID} ${d.expired ? "(expired)" : ""}</div>`;
+    } else if (ev.event_type === "end_of_round") {
+      return `<div style="color:var(--yellow)">[${ev.ex.toUpperCase()}] END_OF_ROUND</div>`;
+    }
+    return `<div>[${ev.ex.toUpperCase()}] ${ev.event_type} ${JSON.stringify(d)}</div>`;
+  });
+  document.getElementById("events").innerHTML = lines.join("") ||
+    `<div class="small">no events yet</div>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[c]);
+}
+
+document.addEventListener("change", e => {
+  if (e.target.id === "ob-ex") {
+    document.getElementById("ob-inst").dataset.ex = ""; // force rebuild
+    selectedObEx = e.target.value;
+    refresh();
+  } else if (e.target.id === "ob-inst") {
+    selectedObInst = e.target.value;
+    refreshOrderbook();
+  } else if (e.target.id === "ev-ex") {
+    selectedEvEx = e.target.value;
+    renderEvents();
+  }
+});
+document.addEventListener("input", e => {
+  if (e.target.id === "ev-filter") { evFilter = e.target.value; renderEvents(); }
+});
+
+refresh();
+refreshOrderbook();
+setInterval(refresh, 1000);
+setInterval(refreshOrderbook, 500);
+</script>
+</body>
+</html>
