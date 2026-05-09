@@ -121,6 +121,8 @@ class ExchangeState:
     last_flat_ms: dict[str, int] = field(default_factory=dict)
     inventory_synced: bool = False
     pending_orders_synced: bool = False
+    # diagnostic counter — number of add_order rejections since (re)connect
+    rejects: int = 0
 
     def position(self, instrument: str) -> int:
         return int(self.positions.get(instrument, 0))
@@ -615,11 +617,15 @@ class RailEdgeBot:
         rate_limit: int = 450,
         order_ttl_ms: int = DEFAULT_ORDER_TTL_MS,
         inventory_every_ms: int = 1_000,
+        verbose: bool = False,
+        heartbeat_every_s: float = 5.0,
     ) -> None:
         self.configs = configs
         self.rate_limit = rate_limit
         self.order_ttl_ms = order_ttl_ms
         self.inventory_every_ms = inventory_every_ms
+        self.verbose = verbose
+        self.heartbeat_every_s = heartbeat_every_s
 
     async def run(self) -> None:
         await asyncio.gather(
@@ -632,6 +638,11 @@ class RailEdgeBot:
 
         url = f"ws://{exchange.lower()}.algotrade.hr:9001/trade"
         backoff = 1.0
+        # session-wide counters for heartbeat
+        sess_fills = 0
+        sess_rejects = 0
+        sess_realized = 0  # cumulative cash delta from fills
+        last_hb = time.monotonic()
         while True:
             state = ExchangeState(exchange=exchange)
             strategy = RailEdgeStrategy(config)
@@ -703,6 +714,12 @@ class RailEdgeBot:
                             continue
 
                         now_ms = int(message.get("time", 0))
+
+                        # snapshot state before event processing so we can
+                        # log fills as state diffs after the loop
+                        pre_pos  = state.position(config.instrument)
+                        pre_cash = state.cash
+
                         for event in message.get("events", []):
                             if event.get("event_type") == "trade":
                                 strategy.apply_trade_event(state, event)
@@ -711,6 +728,34 @@ class RailEdgeBot:
                                 order_id = data.get("orderID")
                                 if order_id is not None:
                                     state.drop_order(int(order_id))
+
+                        post_pos  = state.position(config.instrument)
+                        post_cash = state.cash
+                        if post_pos != pre_pos or post_cash != pre_cash:
+                            sess_fills += 1
+                            d_pos  = post_pos - pre_pos
+                            d_cash = post_cash - pre_cash
+                            sess_realized += d_cash
+                            print(
+                                f"[{exchange}] FILL {config.symbol} "
+                                f"pos {pre_pos:+5d}→{post_pos:+5d} ({d_pos:+5d}) "
+                                f"cash ${pre_cash/100:>9,.0f}→${post_cash/100:>9,.0f} "
+                                f"({d_cash/100:+,.2f})",
+                                flush=True,
+                            )
+
+                        # heartbeat: periodic state dump per exchange
+                        if time.monotonic() - last_hb >= self.heartbeat_every_s:
+                            last_hb = time.monotonic()
+                            print(
+                                f"[{exchange}] hb {config.symbol} "
+                                f"pos={state.position(config.instrument):+d} "
+                                f"cash=${state.cash/100:,.0f} "
+                                f"live={len(state.live_orders)} "
+                                f"fills={sess_fills} rejects={sess_rejects} "
+                                f"realized=${sess_realized/100:+,.0f}",
+                                flush=True,
+                            )
 
                         depths = message.get("orderbook_depths", {})
                         depth = depths.get(config.instrument)
@@ -793,7 +838,8 @@ class RailEdgeBot:
         data = message.get("data", {})
         if not message.get("success"):
             msg = (data or {}).get("message") if isinstance(data, dict) else None
-            print(f"[{exchange}] add_order failed: {msg}", flush=True)
+            state.rejects += 1
+            print(f"[{exchange}] add_order failed [{order.role}]: {msg}", flush=True)
             return True
 
         had_fill = bool(

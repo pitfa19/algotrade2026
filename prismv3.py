@@ -1,1317 +1,873 @@
 #!/usr/bin/env python3
-"""
-prism2.py — AlgoTrade 2026 trading bot, v2.
+"""Rail-liquidity bot for the AlgoTrade 2026 exchange API.
 
-Built on prism v1 (multi-venue ETF routing + sub-ETF identity + atomic plans),
-with five data-driven additions calibrated against the 9-venue training set:
+The edge is deliberately simple:
 
-  1. **Per-instrument adaptive thresholds.** Each ticker tracks a rolling window
-     of observed cross-venue spreads. Threshold floats to a fixed quantile of
-     that distribution — wide for CARD (~600¢ p25 spread), tight for ZITO (~60¢).
-     One global XV_EDGE was firing on every single snapshot in tests and not
-     filtering anything.
+* keep a passive bid just above the low rail on the selected instrument;
+* keep a passive ask at the high rail on the same instrument;
+* when either passive rail order fills, close the inventory with IOC orders
+  only against visible depth that is back in the normal market.
 
-  2. **Depth walking on book sweeps.** v1 sized cross-venue arb at the lesser
-     of best_bid_qty / best_ask_qty (level 1 only). With observed spreads of
-     50-300¢, levels 2-3 are still well above any reasonable edge floor, so
-     we walk them for the additional fills.
-
-  3. **Microprice in fair value.** v1's Book class had .microprice but it was
-     never called. Asymmetric depth (50 bid / 10 ask) is a real signal of
-     where the next print lands; using mid throws it away.
-
-  4. **Inventory-tapered sizing.** Hard caps (SOFT_POS_MAX) only protect against
-     hitting the wall. We add a graduated taper: as |position| approaches the
-     cap, new orders shrink quadratically and the threshold widens. This avoids
-     "all-or-nothing" inventory cycles.
-
-  5. **Per-strategy P&L instrumentation.** Each fill is attributed to its source
-     strategy. Heartbeat logs PnL by strategy so you can see which actually
-     made money and disable / tune the rest after a dry segment.
-
-Also: cluster-aware leg preference — when multiple counterparties tie on price,
-prefer the one in the same cluster (lower drift cost during fill).
+This file is standalone on purpose. It does not depend on any reference bot
+framework, so it can be copied to the team VM and run directly.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import json
-import logging
-import math
-import os
-import random
-import signal
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any
 
 try:
-    from websockets.asyncio.client import connect as ws_connect
-except ImportError:
-    from websockets.client import connect as ws_connect  # type: ignore
+    import websockets
+except ImportError:  # pragma: no cover - exercised only on machines without deps.
+    websockets = None
 
-# ════════════════════════════════════════════════════════════════════════════
-# Universe (unchanged from v1)
-# ════════════════════════════════════════════════════════════════════════════
 
-VENUES = ["NYSE", "NASDAQ", "SSE", "JPX", "EURONEXT", "LSE", "HKEX", "NSE", "TMX", "ZSE"]
-WS_HOSTS = {
-    "NYSE":     "nyse.algotrade.hr",
-    "NASDAQ":   "nasdaq.algotrade.hr",
-    "SSE":      "sse.algotrade.hr",
-    "JPX":      "jpx.algotrade.hr",
-    "EURONEXT": "euronext.algotrade.hr",
-    "LSE":      "lse.algotrade.hr",
-    "HKEX":     "hkex.algotrade.hr",
-    "NSE":      "nse.algotrade.hr",
-    "TMX":      "tmx.algotrade.hr",
-    "ZSE":      "zse.algotrade.hr",
-}
+INITIAL_CASH = 10_000_000
+CASH_FLOOR = -5_000_000        # hard server floor (-$50k)
+SOFT_CASH_FLOOR = -4_500_000   # soft floor (-$45k) — keeps a $5k buffer
+MAX_LONG = 2_000
+SOFT_MAX_LONG = 1_800          # soft long cap — keeps a 200-share buffer
+MAX_SHORT = -200
+SOFT_MAX_SHORT = -180          # soft short cap
+DEFAULT_ORDER_TTL_MS = 20_000
 
-# Latency clusters (used for tie-breaking in counterparty selection).
-# Within-cluster RTT is small; across is 80-180ms, which costs us drift.
-CLUSTERS = {
-    "NA":   {"NYSE", "NASDAQ", "TMX"},
-    "EU":   {"LSE", "EURONEXT"},
-    "ASIA": {"JPX", "HKEX", "SSE"},
-    "IN":   {"NSE"},
-    "ZSE":  {"ZSE"},
-}
-CLUSTER_OF = {v: c for c, vs in CLUSTERS.items() for v in vs}
 
-LISTINGS: dict[str, set[str]] = {
-    "CARD":  {"NYSE","NASDAQ","LSE","EURONEXT","JPX","SSE","HKEX","NSE","TMX","ZSE"},
-    "SIMP":  {"NYSE","NASDAQ","LSE","EURONEXT","JPX","SSE","HKEX","NSE","TMX","ZSE"},
-    "NGUP":  {"NYSE","NASDAQ","EURONEXT","TMX","ZSE"},
-    "OIT":   {"LSE","EURONEXT","HKEX","NSE","ZSE"},
-    "KTST":  {"NYSE","JPX","TMX","ZSE"},
-    "FSR":   {"NASDAQ","LSE","SSE","HKEX","ZSE"},
-    "JZRO":  {"NYSE","LSE","EURONEXT","TMX","ZSE"},
-    "XFR":   {"NYSE","HKEX","TMX","ZSE"},
-    "KOTD":  {"NASDAQ","LSE","EURONEXT","HKEX","ZSE"},
-    "INA":   {"NYSE","NASDAQ","EURONEXT","HKEX","ZSE"},
-    "HT":    {"NASDAQ","LSE","JPX","SSE","TMX","ZSE"},
-    "JNAF":  {"NYSE","EURONEXT","JPX","HKEX","ZSE"},
-    "DLKV":  {"NASDAQ","LSE","HKEX","NSE","ZSE"},
-    "DDJH":  {"NYSE","LSE","EURONEXT","TMX","ZSE"},
-    "MDKA":  {"NYSE","LSE","HKEX","TMX","ZSE"},
-    "KRAS":  {"NYSE","EURONEXT","SSE","TMX","ZSE"},
-    "ZITO":  {"NASDAQ","LSE","EURONEXT","NSE","ZSE"},
-    "ZABA":  {"NYSE","LSE","SSE","NSE","TMX","ZSE"},
-    "GOLD":  {"NASDAQ","EURONEXT","JPX","TMX","ZSE"},
-    "XAG":   {"LSE","EURONEXT","JPX","ZSE"},
-    "ETFA":  {"NYSE","EURONEXT","HKEX","ZSE"},
-    "ETFB":  {"NASDAQ","LSE","HKEX","ZSE"},
-    "ETFA3": {"NYSE","TMX","ZSE"},
-    "ETFB3": {"NASDAQ","HKEX","ZSE"},
-    "ETFSH": {"EURONEXT","JPX","ZSE"},
-}
-ETF_BASKETS = {
-    "ETFA":  ["NGUP", "OIT", "KTST", "FSR", "JZRO", "XFR"],
-    "ETFB":  ["KOTD", "INA", "HT", "JNAF", "DLKV", "DDJH"],
-    "ETFA3": ["NGUP", "KTST", "XFR"],
-    "ETFB3": ["KOTD", "INA", "DLKV"],
-    "ETFSH": ["GOLD", "XAG"],
-}
-ETFS = list(ETF_BASKETS)
-STOCKS = sorted(set(LISTINGS) - set(ETF_BASKETS))
-SUB_ETF_LINKS = {
-    "ETFA": ("ETFA3", ["OIT", "FSR", "JZRO"]),
-    "ETFB": ("ETFB3", ["HT",  "JNAF", "DDJH"]),
-}
-
-# ════════════════════════════════════════════════════════════════════════════
-# Limits & knobs
-# ════════════════════════════════════════════════════════════════════════════
-
-POS_MAX            =  2_000
-POS_MIN            =   -200
-INITIAL_CASH       = 10_000_000
-CASH_FLOOR         = -5_000_000
-MAX_PENDING_ORDERS =  6_000
-SERVER_RATE_PER_S  =    500
-
-RATE_PER_S         =    400
-SOFT_POS_MAX       =  1_800
-SOFT_POS_MIN       =   -180
-SOFT_CASH_FLOOR    = -4_500_000
-
-# Base thresholds — these are now FLOORS. The adaptive layer only ever makes
-# the actual threshold larger, never smaller.
-BASE_XV_EDGE       =      4
-BASE_ARB_EDGE      =      4
-BASE_SUB_ETF_EDGE  =      6
-
-# Adaptive threshold params.
-ADAPT_WINDOW       =    200       # snapshots in rolling window per (ticker, strategy)
-ADAPT_QUANTILE     =      0.30    # threshold ≥ this percentile of recent observed spreads
-ADAPT_MIN_SAMPLES  =     20       # need this many before activating adaptive
-
-# Inventory taper (graduated sizing as you approach hard caps).
-TAPER_START_FRAC   =      0.5     # below 50% of capacity → no taper
-TAPER_END_FRAC     =      0.95    # above 95% → essentially zero new orders
-
-# Depth walking — how many extra cents past best to consider in cross-venue.
-DEPTH_WALK_CENTS   =     20
-
-ARB_MAX_K          =     25
-XV_MAX_QTY         =    100       # raised — depth walking lets us go bigger
-MM_INSIDE_TICK     =      1
-MM_QTY             =      4
-MM_REFRESH_S       =      1.5
-MM_INSTRUMENTS     = ["CARD", "SIMP", "ETFA", "ETFB", "GOLD", "XAG", "ETFSH"]
-
-DEFAULT_ROUND_MS   = 600_000
-EOS_UNWIND_MS      =  60_000
-EOS_FLATTEN_MS     =   8_000
-INVENTORY_PERIOD_S =      2.0
-HEARTBEAT_LOG_S    =      5.0
-MAX_BACKOFF_S      =      4.0
-
-LOGLEVEL = os.environ.get("LOGLEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOGLEVEL, logging.INFO),
-    format="%(asctime)s.%(msecs)03d %(levelname).1s %(message)s",
-    datefmt="%H:%M:%S",
+EXCHANGES = (
+    "NYSE",
+    "NASDAQ",
+    "SSE",
+    "JPX",
+    "Euronext",
+    "LSE",
+    "HKEX",
+    "NSE",
+    "TMX",
+    "ZSE",
 )
-log = logging.getLogger("prism2")
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
+@dataclass(frozen=True)
+class RailConfig:
+    exchange: str
+    symbol: str
+    low_bid_price: int
+    high_ask_price: int
+    close_bid_min: int
+    close_ask_max: int
+    # ---- v2 knobs (defaults preserve old behavior on unspecified configs) ----
+    # Hard cap per individual rail ticket. Smaller = capacity can't be blown
+    # in a single fill; rail re-posts after each fill via the regular planner.
+    lot_size: int = 200
+    # Whether the high rail may short via a *resting* limit ask. Many
+    # matching engines (this one included, per server "Insufficient
+    # inventory" rejections) only accept resting asks against owned shares.
+    # Default off — the symmetric upside catch must come via a crossing
+    # IOC instead, which `_plan_close_order` already does for short
+    # inventory we accumulate from real fills.
+    allow_short_rail: bool = False
+    # If we have been holding inventory for longer than this, flatten with a
+    # market order. The rail edge was already locked in at the rail-fill price;
+    # this just frees capital for the next cycle.
+    force_close_after_ms: int = 5_000
 
+    @property
+    def instrument(self) -> str:
+        return f"{self.exchange}-{self.symbol}"
 
-# ════════════════════════════════════════════════════════════════════════════
-# Order book (extended with depth walking and microprice usage)
-# ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
-class Book:
-    bids: dict[int, int] = field(default_factory=dict)
-    asks: dict[int, int] = field(default_factory=dict)
-    last_update_wall: float = 0.0
-
-    def update(self, depth: dict) -> None:
-        self.bids = {int(p): int(q) for p, q in depth.get("bids", {}).items()}
-        self.asks = {int(p): int(q) for p, q in depth.get("asks", {}).items()}
-        self.last_update_wall = time.monotonic()
-
-    @property
-    def best_bid(self) -> Optional[int]:
-        return max(self.bids) if self.bids else None
-
-    @property
-    def best_ask(self) -> Optional[int]:
-        return min(self.asks) if self.asks else None
-
-    @property
-    def best_bid_qty(self) -> int:
-        bb = self.best_bid
-        return self.bids.get(bb, 0) if bb is not None else 0
-
-    @property
-    def best_ask_qty(self) -> int:
-        ba = self.best_ask
-        return self.asks.get(ba, 0) if ba is not None else 0
-
-    @property
-    def mid(self) -> Optional[float]:
-        bb, ba = self.best_bid, self.best_ask
-        return (bb + ba) / 2.0 if bb is not None and ba is not None else None
-
-    @property
-    def microprice(self) -> Optional[float]:
-        bb, ba = self.best_bid, self.best_ask
-        if bb is None or ba is None:
-            return None
-        bq, aq = self.best_bid_qty, self.best_ask_qty
-        if bq + aq == 0:
-            return (bb + ba) / 2.0
-        return (bb * aq + ba * bq) / (bq + aq)
-
-    # NEW: depth walking. Returns (cumulative_qty, weighted_avg_price) up to a price limit.
-    def buy_depth_to(self, price_limit: int) -> tuple[int, Optional[float]]:
-        """If we send a buy IOC at price_limit, how much can we get and at what avg fill?"""
-        total_q, total_cost = 0, 0
-        for p in sorted(self.asks):
-            if p > price_limit:
-                break
-            q = self.asks[p]
-            total_q += q
-            total_cost += p * q
-        if total_q == 0:
-            return 0, None
-        return total_q, total_cost / total_q
-
-    def sell_depth_to(self, price_limit: int) -> tuple[int, Optional[float]]:
-        """If we send a sell IOC at price_limit, how much will fill and at what avg price?"""
-        total_q, total_revenue = 0, 0
-        for p in sorted(self.bids, reverse=True):
-            if p < price_limit:
-                break
-            q = self.bids[p]
-            total_q += q
-            total_revenue += p * q
-        if total_q == 0:
-            return 0, None
-        return total_q, total_revenue / total_q
+class LiveOrder:
+    local_id: str
+    order_id: int
+    instrument: str
+    side: str
+    price: int
+    remaining: int
+    role: str
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Adaptive threshold tracker — per-instrument, per-strategy
-# ════════════════════════════════════════════════════════════════════════════
+@dataclass
+class PendingOrder:
+    local_id: str
+    instrument: str
+    side: str
+    price: int | None
+    quantity: int
+    order_type: str
+    role: str
 
-class SpreadTracker:
-    """Rolling window of observed spreads per (strategy, ticker).
 
-    On every strategize tick, the strategy code records the *current* observed
-    spread (whether or not it acted). The threshold for firing is set to a
-    quantile of that distribution, never below the base floor.
-    """
-    def __init__(self):
-        self._windows: dict[tuple[str, str], deque[float]] = {}
+@dataclass
+class ExchangeState:
+    exchange: str
+    cash: int = INITIAL_CASH
+    # Truth from the most recent get_inventory_response.
+    #   reserved_cash  = data["$"][0]       — cash locked in resting bids
+    #   reserved_qty[I]= data[I][0]         — shares locked in resting asks of I
+    # We use these to compute EXACT free cash / free shares so a new order
+    # cannot overshoot the server's hard limits.
+    reserved_cash: int = 0
+    positions: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    reserved_qty: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    live_orders: dict[int, LiveOrder] = field(default_factory=dict)
+    inflight_orders: dict[str, PendingOrder] = field(default_factory=dict)
+    # last time (server ms) at which `position(instrument)` crossed back to 0
+    last_flat_ms: dict[str, int] = field(default_factory=dict)
+    inventory_synced: bool = False
+    pending_orders_synced: bool = False
 
-    def record(self, strategy: str, ticker: str, spread: float) -> None:
-        if spread <= 0:
+    def position(self, instrument: str) -> int:
+        return int(self.positions.get(instrument, 0))
+
+    def reserved_for(self, instrument: str) -> int:
+        return int(self.reserved_qty.get(instrument, 0))
+
+    def is_synced(self) -> bool:
+        return self.inventory_synced and self.pending_orders_synced
+
+    def apply_inventory(self, data: dict[str, list[int]]) -> None:
+        cash_pair = data.get("$")
+        if cash_pair is not None:
+            self.reserved_cash = int(cash_pair[0])
+            self.cash = int(cash_pair[1])
+        for instrument, pair in data.items():
+            if instrument == "$":
+                continue
+            self.reserved_qty[instrument] = int(pair[0])
+            self.positions[instrument] = int(pair[1])
+        self.inventory_synced = True
+
+    def track_order(
+        self,
+        local_id: str,
+        order_id: int,
+        instrument: str,
+        side: str,
+        price: int,
+        quantity: int,
+        role: str,
+    ) -> None:
+        self.live_orders[int(order_id)] = LiveOrder(
+            local_id=local_id,
+            order_id=int(order_id),
+            instrument=instrument,
+            side=side,
+            price=int(price),
+            remaining=int(quantity),
+            role=role,
+        )
+
+    def drop_order(self, order_id: int) -> None:
+        self.live_orders.pop(int(order_id), None)
+
+    def track_inflight(self, order: PendingOrder) -> None:
+        self.inflight_orders[order.local_id] = order
+
+    def drop_inflight(self, local_id: str | None) -> None:
+        if local_id is not None:
+            self.inflight_orders.pop(local_id, None)
+
+
+    def pending_qty(
+        self,
+        instrument: str,
+        side: str | None = None,
+        price: int | None = None,
+        role: str | None = None,
+    ) -> int:
+        total = 0
+        for order in self.live_orders.values():
+            if order.instrument != instrument:
+                continue
+            if side is not None and order.side != side:
+                continue
+            if price is not None and order.price != price:
+                continue
+            if role is not None and order.role != role:
+                continue
+            total += max(0, order.remaining)
+        for order in self.inflight_orders.values():
+            if order.instrument != instrument:
+                continue
+            if side is not None and order.side != side:
+                continue
+            if price is not None and order.price != price:
+                continue
+            if role is not None and order.role != role:
+                continue
+            total += max(0, order.quantity)
+        return total
+
+    def pending_bid_value(self) -> int:
+        live_value = sum(
+            max(0, order.remaining) * order.price
+            for order in self.live_orders.values()
+            if order.side == "bid"
+        )
+        inflight_value = sum(
+            max(0, order.quantity) * int(order.price or 0)
+            for order in self.inflight_orders.values()
+            if order.side == "bid"
+        )
+        return live_value + inflight_value
+
+    def inflight_bid_value(self) -> int:
+        """Bids we've sent but the server has not yet ack'd (and therefore
+        not yet added to its `reserved_cash` accounting). Anything in
+        `live_orders` is *already* in server `reserved_cash`."""
+        return sum(
+            max(0, order.quantity) * int(order.price or 0)
+            for order in self.inflight_orders.values()
+            if order.side == "bid"
+        )
+
+    def inflight_ask_qty(self, instrument: str) -> int:
+        """Asks we've sent but the server has not yet ack'd."""
+        return sum(
+            max(0, order.quantity)
+            for order in self.inflight_orders.values()
+            if order.side == "ask" and order.instrument == instrument
+        )
+
+    def free_cash(self) -> int:
+        """Cash the server would still let us reserve right now: total
+        balance − what's already reserved server-side − what we've sent
+        and not yet had ack'd. Subtract the hard floor to get the
+        maximum bid value we can still issue."""
+        return self.cash - self.reserved_cash - self.inflight_bid_value() - CASH_FLOOR
+
+    def free_qty(self, instrument: str) -> int:
+        """Shares we can put into a NEW resting ask: position −
+        already-reserved-by-resting-asks − inflight-asks."""
+        return (
+            self.position(instrument)
+            - self.reserved_for(instrument)
+            - self.inflight_ask_qty(instrument)
+        )
+
+
+
+def default_rail_configs() -> dict[str, RailConfig]:
+    # Rails are TAIL CATCHERS: they should only fill when a market order
+    # walks the book deep enough to leave the touch. Prices like $105 or
+    # $129 sit too close to where CARD/SIMP actually trade, so the rail
+    # ends up crossing the touch on every other tick — which on the
+    # short-resting side fails as "Insufficient inventory" against a flat
+    # account. Pushing them well outside the typical range fixes this.
+    #
+    # low_bid  = $50  → only fills if a giant market-sell walks through every
+    #                   higher resting bid (rare, but the whole edge).
+    # high_ask = $150 → only fills when we already own shares AND a giant
+    #                   market-buy lifts the asks past $150.
+    # close thresholds straddle the natural ~$100 mid so the polite IOC
+    # close fires reliably; the 5s force-close is the backstop.
+    return {
+        "NASDAQ":   RailConfig("NASDAQ",   "CARD", 5000, 15000, 9900, 10100),
+        "ZSE":      RailConfig("ZSE",      "CARD", 5000, 15000, 9900, 10100),
+        "SSE":      RailConfig("SSE",      "CARD", 5000, 15000, 9900, 10100),
+        "LSE":      RailConfig("LSE",      "CARD", 5000, 15000, 9900, 10100),
+        "JPX":      RailConfig("JPX",      "CARD", 5000, 15000, 9900, 10100),
+        "NSE":      RailConfig("NSE",      "SIMP", 5000, 15000, 9900, 10100),
+        "HKEX":     RailConfig("HKEX",     "SIMP", 5000, 15000, 9900, 10100),
+        "NYSE":     RailConfig("NYSE",     "CARD", 5000, 15000, 9900, 10100),
+        "TMX":      RailConfig("TMX",      "CARD", 5000, 15000, 9900, 10100),
+        "Euronext": RailConfig("Euronext", "SIMP", 5000, 15000, 9900, 10100),
+    }
+
+
+class RailEdgeStrategy:
+    def __init__(self, config: RailConfig) -> None:
+        self.config = config
+
+    def apply_trade_event(self, state: ExchangeState, event: dict[str, Any]) -> None:
+        data = event.get("data", event)
+        order_id = data.get("passiveOrderID")
+        if order_id is None:
             return
-        key = (strategy, ticker)
-        q = self._windows.get(key)
-        if q is None:
-            q = deque(maxlen=ADAPT_WINDOW)
-            self._windows[key] = q
-        q.append(float(spread))
 
-    def threshold(self, strategy: str, ticker: str, base_floor: int) -> int:
-        q = self._windows.get((strategy, ticker))
-        if q is None or len(q) < ADAPT_MIN_SAMPLES:
-            return base_floor
-        # Use a quantile — threshold should be at "normal" spread level so we
-        # don't fire on every small inefficiency, but also don't miss most opps.
-        sorted_q = sorted(q)
-        idx = int(ADAPT_QUANTILE * len(sorted_q))
-        adaptive = sorted_q[idx]
-        return max(base_floor, int(adaptive))
+        order = state.live_orders.get(int(order_id))
+        if order is None:
+            return
 
-    def stats(self) -> dict[str, int]:
-        return {f"{s}-{t}": len(q) for (s, t), q in self._windows.items()}
+        quantity = min(int(data["quantity"]), order.remaining)
+        price = int(data.get("price", order.price))
+        if quantity <= 0:
+            return
+
+        if order.side == "bid":
+            state.positions[order.instrument] = state.position(order.instrument) + quantity
+            state.cash -= price * quantity
+        else:
+            state.positions[order.instrument] = state.position(order.instrument) - quantity
+            state.cash += price * quantity
+
+        order.remaining -= quantity
+        if order.remaining <= 0:
+            state.drop_order(order.order_id)
+
+    def apply_immediate_fill(
+        self, state: ExchangeState, order: PendingOrder, response_data: dict[str, Any]
+    ) -> None:
+        inv_change = response_data.get("immediate_inventory_change")
+        cash_change = response_data.get("immediate_balance_change")
+        if inv_change is None and cash_change is None:
+            return
+
+        if inv_change is not None:
+            state.positions[order.instrument] = (
+                state.position(order.instrument) + int(inv_change)
+            )
+        if cash_change is not None:
+            state.cash += int(cash_change)
+
+    def plan_orders(
+        self,
+        state: ExchangeState,
+        depth: dict[str, dict[str, int]] | None,
+        now_ms: int,
+    ) -> list[dict[str, Any]]:
+        # If we haven't had our first inventory + pending-orders snapshot
+        # yet, do not plan: any sizing would be against ghost defaults and
+        # the server will reject (Insufficient balance / inventory).
+        if not state.is_synced():
+            return []
+
+        instrument = self.config.instrument
+        orders: list[dict[str, Any]] = []
+
+        # 1. Force-flatten if inventory has been held past the timeout.
+        force_close = self._plan_force_close(state, now_ms)
+        if force_close is not None:
+            orders.append(force_close)
+
+        # 2. Polite IOC close at the configured "fair" thresholds.
+        close_order = self._plan_close_order(state, depth)
+        if close_order is not None:
+            orders.append(close_order)
+
+        # Reservations made by close + force_close, in the units each
+        # downstream sizer needs:
+        #   ask sizer wants SHARES (we'd be reducing free_qty)
+        #   bid sizer wants VALUE  (we'd be reducing free_cash)
+        extra_ask_qty   = 0
+        extra_bid_value = 0
+        for o in orders:
+            if o["side"] == "ask":
+                extra_ask_qty   += int(o["quantity"])
+            else:
+                extra_bid_value += int(o["quantity"]) * int(o.get("price") or 0)
+
+        # 3. Re-arm rails.
+        bid_qty = self._rail_bid_quantity(state, extra_bid_value)
+        if bid_qty > 0:
+            orders.append(
+                self._order(
+                    instrument=instrument, side="bid",
+                    price=self.config.low_bid_price, quantity=bid_qty,
+                    order_type="limit", role="rail",
+                )
+            )
+
+        ask_qty = self._rail_ask_quantity(state, extra_ask_qty)
+        if ask_qty > 0:
+            orders.append(
+                self._order(
+                    instrument=instrument, side="ask",
+                    price=self.config.high_ask_price, quantity=ask_qty,
+                    order_type="limit", role="rail",
+                )
+            )
+
+        return orders
+
+    def _plan_force_close(
+        self, state: ExchangeState, now_ms: int
+    ) -> dict[str, Any] | None:
+        """If we have been holding inventory past `force_close_after_ms`,
+        flatten with a market order. Captures whatever liquidity is there,
+        guarantees we recycle capital."""
+        instrument = self.config.instrument
+        pos = state.position(instrument)
+        if pos == 0:
+            state.last_flat_ms[instrument] = int(now_ms)
+            return None
+        last_flat = state.last_flat_ms.get(instrument)
+        if last_flat is None:
+            # first non-zero observation — anchor the timer here so the polite
+            # IOC close path gets a chance before we fall back to market.
+            state.last_flat_ms[instrument] = int(now_ms)
+            return None
+        if int(now_ms) - last_flat < int(self.config.force_close_after_ms):
+            return None
+        # past timeout — flatten, market style.
+        if pos > 0:
+            return self._order(
+                instrument=instrument,
+                side="ask",
+                price=0,                # ignored for market
+                quantity=pos,
+                order_type="market",
+                role="force_close",
+            )
+        return self._order(
+            instrument=instrument,
+            side="bid",
+            price=0,
+            quantity=-pos,
+            order_type="market",
+            role="force_close",
+        )
+
+    def _plan_close_order(
+        self, state: ExchangeState, depth: dict[str, dict[str, int]] | None
+    ) -> dict[str, Any] | None:
+        if not depth:
+            return None
+
+        instrument = self.config.instrument
+        pos = state.position(instrument)
+
+        if pos > 0:
+            # SELL into ≥ close_bid_min bids. Cap at FREE shares — i.e.
+            # owned minus what's already reserved by other resting/inflight
+            # asks — so we never request to sell more than we own.
+            free = state.free_qty(instrument)
+            qty = min(free, pos,
+                      visible_qty_at_or_better(depth.get("bids", {}),
+                                               self.config.close_bid_min, "bid"))
+            if qty > 0:
+                return self._order(
+                    instrument=instrument, side="ask",
+                    price=self.config.close_bid_min, quantity=qty,
+                    order_type="ioc", role="close",
+                )
+
+        if pos < 0:
+            # BUY against ≤ close_ask_max asks. The cash needed = qty * limit;
+            # cap by free_cash so we never overshoot the cash floor.
+            need_qty = -pos
+            visible = visible_qty_at_or_better(depth.get("asks", {}),
+                                               self.config.close_ask_max, "ask")
+            cash_qty = state.free_cash() // self.config.close_ask_max
+            qty = max(0, min(need_qty, visible, cash_qty))
+            if qty > 0:
+                return self._order(
+                    instrument=instrument, side="bid",
+                    price=self.config.close_ask_max, quantity=qty,
+                    order_type="ioc", role="close",
+                )
+
+        return None
+
+    def _rail_bid_quantity(self, state: ExchangeState, extra_reserved_value: int = 0) -> int:
+        """Exact bid sizing using server truth.
+
+        `state.free_cash()` returns the most cash we can still spend: total −
+        already-reserved − inflight-bids − hard floor. The new bid's value
+        plus any same-tick close reservation MUST stay within that.
+        """
+        instrument = self.config.instrument
+        # 1. respect the resting-target cap (don't stack)
+        pending_qty = state.pending_qty(
+            instrument, side="bid", price=self.config.low_bid_price, role="rail"
+        )
+        target_room = max(0, int(self.config.lot_size) - pending_qty)
+        # 2. respect the position ceiling
+        position_room = max(0, MAX_LONG - state.position(instrument) - pending_qty)
+        # 3. EXACT cash check: take the server's free cash, subtract any
+        #    cash we've reserved THIS tick (close BIDs covering shorts),
+        #    and divide by the bid price.
+        free = state.free_cash() - int(extra_reserved_value)
+        cash_qty = max(0, free // self.config.low_bid_price)
+        return max(0, min(target_room, position_room, cash_qty))
+
+    def _rail_ask_quantity(self, state: ExchangeState, extra_reserved_qty: int = 0) -> int:
+        """Exact ask sizing: only sell shares we *actually own and aren't
+        already trying to sell*. `state.free_qty()` is position −
+        server-reserved-by-resting-asks − inflight-asks."""
+        instrument = self.config.instrument
+        pending_qty = state.pending_qty(instrument, side="ask", role="rail")
+        target_room = max(0, int(self.config.lot_size) - pending_qty)
+        free = state.free_qty(instrument) - int(extra_reserved_qty)
+        if self.config.allow_short_rail:
+            # If shorting via resting asks is permitted on this venue,
+            # extend capacity down to MAX_SHORT.
+            free = max(free, state.position(instrument) - MAX_SHORT
+                       - state.reserved_for(instrument)
+                       - state.inflight_ask_qty(instrument)
+                       - int(extra_reserved_qty))
+        return max(0, min(target_room, free))
+
+    @staticmethod
+    def _order(
+        instrument: str,
+        side: str,
+        price: int,
+        quantity: int,
+        order_type: str,
+        role: str,
+    ) -> dict[str, Any]:
+        return {
+            "instrument_id": instrument,
+            "side": side,
+            "price": int(price),
+            "quantity": int(quantity),
+            "order_type": order_type,
+            "role": role,
+        }
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Per-strategy P&L stats
-# ════════════════════════════════════════════════════════════════════════════
-
-class StatsTracker:
-    """Realized cash deltas attributed to each strategy that fired the leg."""
-    def __init__(self):
-        self.realized_by_strategy: dict[str, int] = defaultdict(int)
-        self.fills_by_strategy: dict[str, int] = defaultdict(int)
-        self.attempts_by_strategy: dict[str, int] = defaultdict(int)
-
-    def record_attempt(self, strategy: str) -> None:
-        self.attempts_by_strategy[strategy] += 1
-
-    def record_fill(self, strategy: str, cash_delta_cents: int) -> None:
-        self.realized_by_strategy[strategy] += cash_delta_cents
-        self.fills_by_strategy[strategy] += 1
-
-    def summary(self) -> str:
-        if not self.realized_by_strategy:
-            return ""
-        lines = []
-        for s in sorted(self.realized_by_strategy, key=lambda k: -self.realized_by_strategy[k]):
-            lines.append(f"{s}: ${self.realized_by_strategy[s]/100:+.0f} "
-                         f"({self.fills_by_strategy[s]} fills, "
-                         f"{self.attempts_by_strategy.get(s, 0)} attempts)")
-        return " | ".join(lines)
+def visible_qty_at_or_better(levels: dict[str, int], threshold: int, side: str) -> int:
+    total = 0
+    for raw_price, raw_qty in levels.items():
+        price = int(raw_price)
+        qty = int(raw_qty)
+        if side == "bid" and price >= threshold:
+            total += qty
+        elif side == "ask" and price <= threshold:
+            total += qty
+    return total
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Token bucket (unchanged)
-# ════════════════════════════════════════════════════════════════════════════
+def build_add_order(
+    request_id: str,
+    instrument_id: str,
+    side: str,
+    price: int | None,
+    quantity: int,
+    order_type: str,
+    ttl_ms: int = DEFAULT_ORDER_TTL_MS,
+) -> dict[str, Any]:
+    message: dict[str, Any] = {
+        "type": "add_order",
+        "user_request_id": request_id,
+        "instrument_id": instrument_id,
+        "side": side,
+        "quantity": int(quantity),
+        "order_type": order_type,
+    }
+    if order_type in {"limit", "ioc"}:
+        if price is None:
+            raise ValueError("limit and IOC orders require an integer price")
+        message["price"] = int(price)
+        message["expiry"] = int(time.time() * 1000) + int(ttl_ms)
+    return message
+
+
+def build_cancel_order(request_id: str, instrument_id: str, order_id: int) -> dict[str, Any]:
+    return {
+        "type": "cancel_order",
+        "user_request_id": request_id,
+        "instrument_id": instrument_id,
+        "order_id": int(order_id),
+    }
+
 
 class TokenBucket:
-    __slots__ = ("rate", "burst", "tokens", "last")
+    def __init__(self, rate_per_second: int, burst: int | None = None) -> None:
+        self.rate_per_second = float(rate_per_second)
+        self.capacity = float(burst if burst is not None else rate_per_second)
+        self.tokens = self.capacity
+        self.updated_at = 0.0
 
-    def __init__(self, rate: float, burst: float | None = None):
-        self.rate = rate
-        self.burst = burst if burst is not None else rate
-        self.tokens = self.burst
-        self.last = time.monotonic()
-
-    async def acquire(self) -> None:
-        while True:
-            now = time.monotonic()
-            self.tokens = min(self.burst, self.tokens + (now - self.last) * self.rate)
-            self.last = now
-            if self.tokens >= 1.0:
-                self.tokens -= 1.0
-                return
-            await asyncio.sleep((1.0 - self.tokens) / self.rate)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Plan / Leg
-# ════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class Leg:
-    exchange: str
-    ticker: str
-    side: str
-    qty: int
-    price: int
-    order_type: str = "ioc"
-    note: str = ""
-    strategy: str = ""  # NEW: tag legs so fill attribution works
-
-    @property
-    def signed_qty(self) -> int:
-        return self.qty if self.side == "bid" else -self.qty
-
-
-@dataclass
-class Plan:
-    legs: list[Leg]
-    edge_cents: float = 0.0
-    strategy: str = ""
-
-    def __repr__(self) -> str:
-        legs_s = " | ".join(
-            f"{l.side[0].upper()}{l.qty}@{l.price/100:.2f} {l.exchange}-{l.ticker}"
-            for l in self.legs
-        )
-        return f"<{self.strategy} edge={self.edge_cents:.1f}c {legs_s}>"
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Hub
-# ════════════════════════════════════════════════════════════════════════════
-
-class Hub:
-    def __init__(self, active_venues: list[str]):
-        self.active_venues = active_venues
-        self.stop = False
-        self.connections: dict[str, "Connection"] = {}
-
-        self.books: dict[tuple[str, str], Book] = {}
-        for tk, vs in LISTINGS.items():
-            for v in vs:
-                if v in active_venues:
-                    self.books[(v, tk)] = Book()
-
-        self.pos: dict[tuple[str, str], int] = defaultdict(int)
-        self.cash: dict[str, int] = {v: INITIAL_CASH for v in active_venues}
-        self.buckets: dict[str, TokenBucket] = {
-            v: TokenBucket(RATE_PER_S, burst=RATE_PER_S) for v in active_venues
-        }
-        self.live_orders: dict[int, tuple[str, str, str, int, int]] = {}
-        self.open_count: dict[str, int] = defaultdict(int)
-        self.req_to_leg: dict[str, Leg] = {}
-        self.last_inventory_req: dict[str, float] = defaultdict(float)
-        self.server_time: dict[str, int] = {}
-        self.round_length: dict[str, int] = {v: DEFAULT_ROUND_MS for v in active_venues}
-        self.ready: dict[str, bool] = {v: False for v in active_venues}
-        self.tickers_on_ex: dict[str, set[str]] = {v: set() for v in active_venues}
-        for tk, vs in LISTINGS.items():
-            for v in vs:
-                if v in active_venues:
-                    self.tickers_on_ex[v].add(tk)
-
-        self.last_fired: dict[str, float] = defaultdict(float)
-        self._req_seq = 0
-
-        self.fills_count = 0
-        self.realized_cents = 0
-        self.last_log = time.monotonic()
-        self.last_mm_refresh: dict[tuple[str, str], float] = defaultdict(float)
-
-        # NEW: adaptive thresholds + per-strategy stats
-        self.spread_tracker = SpreadTracker()
-        self.stats = StatsTracker()
-
-    def req_id(self, tag: str) -> str:
-        self._req_seq += 1
-        return f"p{self._req_seq:08x}-{tag}"
-
-    # ─── inventory taper ─────────────────────────────────────────────
-    def inventory_taper(self, exchange: str, ticker: str, side: str) -> float:
-        """Returns sizing multiplier in [0, 1] based on how close to caps we are.
-
-        Below TAPER_START_FRAC: 1.0 (full size)
-        Above TAPER_END_FRAC:   ~0.05 (tiny)
-        Quadratic in between for smooth deceleration.
-        """
-        pos = self.pos[(exchange, ticker)]
-        if side == "bid":
-            cap = SOFT_POS_MAX
-            frac_used = pos / cap if cap > 0 else 0
-        else:
-            cap = SOFT_POS_MIN
-            frac_used = pos / cap if cap < 0 else 0  # cap negative → frac_used positive when we're short
-        frac_used = max(0.0, min(1.0, frac_used))
-        if frac_used <= TAPER_START_FRAC:
-            return 1.0
-        if frac_used >= TAPER_END_FRAC:
-            return 0.05
-        # Quadratic decay between start and end
-        t = (frac_used - TAPER_START_FRAC) / (TAPER_END_FRAC - TAPER_START_FRAC)
-        return max(0.05, (1.0 - t) ** 2)
-
-    # ─── headroom checks ─────────────────────────────────────────────
-    def fits(self, leg: Leg) -> bool:
-        if not self.ready.get(leg.exchange, False):
-            return False
-        new_pos = self.pos[(leg.exchange, leg.ticker)] + leg.signed_qty
-        if new_pos > SOFT_POS_MAX or new_pos < SOFT_POS_MIN:
-            return False
-        if leg.side == "bid":
-            cost = leg.qty * leg.price
-            if self.cash[leg.exchange] - cost < SOFT_CASH_FLOOR:
-                return False
-        if self.open_count[leg.exchange] + 1 > MAX_PENDING_ORDERS - 50:
-            return False
-        return True
-
-    def commit_optimistic(self, leg: Leg) -> None:
-        self.pos[(leg.exchange, leg.ticker)] += leg.signed_qty
-        if leg.side == "bid":
-            self.cash[leg.exchange] -= leg.qty * leg.price
-        else:
-            self.cash[leg.exchange] += leg.qty * leg.price
-
-    def revert_optimistic(self, leg: Leg) -> None:
-        self.pos[(leg.exchange, leg.ticker)] -= leg.signed_qty
-        if leg.side == "bid":
-            self.cash[leg.exchange] += leg.qty * leg.price
-        else:
-            self.cash[leg.exchange] -= leg.qty * leg.price
-
-    def plan_fits(self, plan: Plan) -> bool:
-        applied: list[Leg] = []
-        try:
-            for leg in plan.legs:
-                if not self.fits(leg):
-                    return False
-                self.commit_optimistic(leg)
-                applied.append(leg)
+    def try_take(self, now: float | None = None, tokens: int = 1) -> bool:
+        now = time.monotonic() if now is None else now
+        elapsed = max(0.0, now - self.updated_at)
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.rate_per_second)
+        self.updated_at = now
+        if self.tokens >= tokens:
+            self.tokens -= tokens
             return True
-        finally:
-            for leg in applied:
-                self.revert_optimistic(leg)
-
-    def fire(self, plan: Plan) -> None:
-        if not self.plan_fits(plan):
-            log.debug("plan rejected (headroom): %r", plan)
-            return
-        self.stats.record_attempt(plan.strategy)
-        log.info("FIRE %r", plan)
-        for leg in plan.legs:
-            leg.strategy = plan.strategy
-            self.commit_optimistic(leg)
-            if not self._send_leg(leg):
-                self.revert_optimistic(leg)
-
-    def fire_one(self, leg: Leg) -> None:
-        if not self.fits(leg):
-            return
-        self.commit_optimistic(leg)
-        self.stats.record_attempt(leg.strategy or "MM")
-        if not self._send_leg(leg):
-            self.revert_optimistic(leg)
-
-    def _send_leg(self, leg: Leg) -> bool:
-        conn = self.connections.get(leg.exchange)
-        if conn is None or not conn.connected:
-            return False
-        rid = self.req_id(f"{leg.note[:16]}" if leg.note else leg.ticker)
-        self.req_to_leg[rid] = leg
-        expiry = now_ms() + 30_000
-        msg: dict = {
-            "type": "add_order",
-            "user_request_id": rid,
-            "instrument_id": f"{leg.exchange}-{leg.ticker}",
-            "side": leg.side,
-            "quantity": leg.qty,
-            "order_type": leg.order_type,
-        }
-        if leg.order_type != "market":
-            msg["price"] = leg.price
-            msg["expiry"] = expiry
-        conn.enqueue(msg)
-        self.open_count[leg.exchange] += 1
-        return True
-
-    # ─── message handlers (mostly unchanged; trade event paths preserved) ─
-    def on_welcome(self, exchange: str) -> None:
-        log.info("welcome %s", exchange)
-        self.ready[exchange] = False
-        for tk in self.tickers_on_ex.get(exchange, set()):
-            self.pos[(exchange, tk)] = 0
-            book = self.books.get((exchange, tk))
-            if book is not None:
-                book.bids = {}
-                book.asks = {}
-        self.cash[exchange] = INITIAL_CASH
-        for oid in list(self.live_orders):
-            if self.live_orders[oid][0] == exchange:
-                self.live_orders.pop(oid, None)
-        self.open_count[exchange] = 0
-        for rid in [r for r, lg in self.req_to_leg.items() if lg.exchange == exchange]:
-            self.req_to_leg.pop(rid, None)
-        self.req_inventory(exchange, force=True)
-        conn = self.connections.get(exchange)
-        if conn and conn.connected:
-            conn.enqueue({
-                "type": "get_pending_orders",
-                "user_request_id": self.req_id(f"pend-{exchange}"),
-            })
-
-    def on_md(self, exchange: str, msg: dict) -> None:
-        t = msg.get("time")
-        if isinstance(t, int):
-            self.server_time[exchange] = t
-        for inst, depth in msg.get("orderbook_depths", {}).items():
-            ex, _, tk = inst.partition("-")
-            if ex != exchange:
-                continue
-            book = self.books.get((ex, tk))
-            if book is not None:
-                book.update(depth)
-        for ev in msg.get("events", []) or []:
-            if ev.get("event_type") != "trade":
-                continue
-            d = ev["data"]
-            for oid_key in ("passiveOrderID", "activeOrderID"):
-                oid = d.get(oid_key)
-                rec = self.live_orders.get(oid)
-                if rec is None:
-                    continue
-                ex, tk, side, qty, px = rec
-                fill_qty = int(d["quantity"])
-                fill_px  = int(d["price"])
-                signed = fill_qty if side == "bid" else -fill_qty
-                self.pos[(ex, tk)] += signed
-                cash_delta = -fill_qty * fill_px if side == "bid" else fill_qty * fill_px
-                self.cash[ex] += cash_delta
-                self.fills_count += 1
-                # Attribute the fill — these are usually MM resting orders.
-                self.stats.record_fill("MM", cash_delta)
-                rem = qty - fill_qty
-                if rem <= 0:
-                    self.live_orders.pop(oid, None)
-                else:
-                    self.live_orders[oid] = (ex, tk, side, rem, px)
-
-    def on_add_order_response(self, exchange: str, msg: dict) -> None:
-        rid = msg.get("user_request_id", "")
-        leg = self.req_to_leg.pop(rid, None)
-        success = bool(msg.get("success"))
-        data = msg.get("data") or {}
-        if leg is None:
-            return
-        self.revert_optimistic(leg)
-        if not success:
-            log.debug("order failed %s: %s", leg.note, data.get("message"))
-            self.open_count[exchange] = max(0, self.open_count[exchange] - 1)
-            return
-        ic = data.get("immediate_inventory_change")
-        bc = data.get("immediate_balance_change")
-        if ic is not None:
-            self.pos[(leg.exchange, leg.ticker)] += int(ic)
-            self.fills_count += 1
-        if bc is not None:
-            self.cash[leg.exchange] += int(bc)
-            self.realized_cents += int(bc)
-            # Per-strategy attribution
-            if leg.strategy:
-                self.stats.record_fill(leg.strategy, int(bc))
-        oid = data.get("order_id")
-        if leg.order_type == "limit" and oid is not None:
-            filled = abs(int(ic)) if ic is not None else 0
-            remaining = leg.qty - filled
-            if remaining > 0:
-                self.live_orders[int(oid)] = (
-                    leg.exchange, leg.ticker, leg.side, remaining, leg.price
-                )
-        else:
-            self.open_count[exchange] = max(0, self.open_count[exchange] - 1)
-
-    def on_cancel_order_response(self, exchange: str, msg: dict) -> None:
-        if msg.get("success"):
-            self.open_count[exchange] = max(0, self.open_count[exchange] - 1)
-
-    def on_inventory(self, exchange: str, msg: dict) -> None:
-        data = msg.get("data") or {}
-        if not isinstance(data, dict):
-            return
-        for inst, pair in data.items():
-            try:
-                _reserved, total = int(pair[0]), int(pair[1])
-            except (ValueError, TypeError, IndexError):
-                continue
-            if inst == "$":
-                self.cash[exchange] = total
-            else:
-                ex, _, tk = inst.partition("-")
-                if ex == exchange:
-                    self.pos[(ex, tk)] = total
-        self.ready[exchange] = True
-
-    def on_pending_orders(self, exchange: str, msg: dict) -> None:
-        data = msg.get("data") or {}
-        live_ids: set[int] = set()
-        for inst, pair in data.items():
-            ex, _, tk = inst.partition("-")
-            if ex != exchange or not isinstance(pair, list) or len(pair) < 2:
-                continue
-            for side_idx, side_label in enumerate(("bid", "ask")):
-                for od in pair[side_idx] or []:
-                    oid = int(od["orderID"])
-                    qty = int(od["unfilled_quantity"])
-                    px  = int(od["price"])
-                    self.live_orders[oid] = (ex, tk, side_label, qty, px)
-                    live_ids.add(oid)
-        for oid in list(self.live_orders):
-            ex0 = self.live_orders[oid][0]
-            if ex0 == exchange and oid not in live_ids:
-                self.live_orders.pop(oid, None)
-
-    def req_inventory(self, exchange: str, force: bool = False) -> None:
-        now = time.monotonic()
-        if not force and now - self.last_inventory_req[exchange] < INVENTORY_PERIOD_S:
-            return
-        self.last_inventory_req[exchange] = now
-        conn = self.connections.get(exchange)
-        if conn and conn.connected:
-            conn.enqueue({
-                "type": "get_inventory",
-                "user_request_id": self.req_id(f"inv-{exchange}"),
-            })
-
-    # ─── strategy bus ────────────────────────────────────────────────
-    def strategize(self) -> None:
-        plans: list[Plan] = []
-        plans += self.etf_basket_arbs()
-        plans += self.sub_etf_arbs()
-        plans += self.cross_venue_arbs()
-        plans += self.settlement_unwind()
-        for plan in plans:
-            self.fire(plan)
-
-        self.passive_mm_refresh()
-
-        now = time.monotonic()
-        if now - self.last_log >= HEARTBEAT_LOG_S:
-            self.last_log = now
-            total_pos_val = 0
-            book_count = 0
-            for (ex, tk), bk in self.books.items():
-                if bk.mid is not None:
-                    book_count += 1
-                    total_pos_val += int(self.pos[(ex, tk)] * bk.mid)
-            total_cash = sum(self.cash.values())
-            log.info(
-                "[hb] books=%d cash=$%.0f pos_mtm=$%.0f fills=%d realized=$%.0f open=%d live_lim=%d",
-                book_count, total_cash / 100, total_pos_val / 100,
-                self.fills_count, self.realized_cents / 100,
-                sum(self.open_count.values()), len(self.live_orders),
-            )
-            summary = self.stats.summary()
-            if summary:
-                log.info("[strat] %s", summary)
-
-    # ─── helper: best counterparty selection with cluster preference ─
-    def _best_buy_venue(self, ticker: str, my_cluster: Optional[str] = None):
-        """Lowest ask across venues, breaking ties by same-cluster."""
-        best = None  # (px, qty, venue)
-        for v in LISTINGS[ticker]:
-            if v not in self.active_venues:
-                continue
-            bk = self.books[(v, ticker)]
-            ba = bk.best_ask
-            if ba is None:
-                continue
-            aq = bk.best_ask_qty
-            score = (ba, 0 if my_cluster and CLUSTER_OF.get(v) == my_cluster else 1)
-            if best is None or score < (best[0], best[3]):
-                best = (ba, aq, v, score[1])
-        if best is None:
-            return None
-        return best[2], best[0], best[1]  # (venue, price, qty)
-
-    def _best_sell_venue(self, ticker: str, my_cluster: Optional[str] = None):
-        """Highest bid across venues, breaking ties by same-cluster."""
-        best = None
-        for v in LISTINGS[ticker]:
-            if v not in self.active_venues:
-                continue
-            bk = self.books[(v, ticker)]
-            bb = bk.best_bid
-            if bb is None:
-                continue
-            bq = bk.best_bid_qty
-            score = (-bb, 0 if my_cluster and CLUSTER_OF.get(v) == my_cluster else 1)
-            if best is None or score < (-best[0], best[3]):
-                best = (bb, bq, v, score[1])
-        if best is None:
-            return None
-        return best[2], best[0], best[1]
-
-    # ─── strategy 1: ETF <-> basket arb (with adaptive threshold) ────
-    def etf_basket_arbs(self) -> list[Plan]:
-        out: list[Plan] = []
-        for etf in ETFS:
-            basket = ETF_BASKETS[etf]
-            n = len(basket)
-            const_bid: dict[str, tuple[str, int, int]] = {}
-            const_ask: dict[str, tuple[str, int, int]] = {}
-            ok = True
-            for tk in basket:
-                bb = self._best_sell_venue(tk)
-                ba = self._best_buy_venue(tk)
-                if bb is None or ba is None:
-                    ok = False; break
-                const_bid[tk] = bb
-                const_ask[tk] = ba
-            if not ok:
-                continue
-            for etf_v in LISTINGS[etf]:
-                if etf_v not in self.active_venues:
-                    continue
-                bk = self.books[(etf_v, etf)]
-                if bk.best_bid is None or bk.best_ask is None:
-                    continue
-
-                # Direction A: ETF cheap → buy ETF, sell basket
-                etf_buy_px = bk.best_ask
-                etf_buy_qty = bk.best_ask_qty
-                synth_sell_total = sum(const_bid[tk][1] for tk in basket)
-                edge_a = synth_sell_total / n - etf_buy_px
-
-                # Record observed edge for adaptive threshold (whether or not we act)
-                if edge_a > 0:
-                    self.spread_tracker.record("ETF_BUY", etf, edge_a)
-                threshold = self.spread_tracker.threshold("ETF_BUY", etf, BASE_ARB_EDGE)
-
-                if edge_a >= threshold:
-                    # Inventory taper on the BUY side (we're going long the ETF)
-                    taper = self.inventory_taper(etf_v, etf, "bid")
-                    k = etf_buy_qty // n
-                    for tk in basket:
-                        k = min(k, const_bid[tk][2])
-                    etf_room = (SOFT_POS_MAX - self.pos[(etf_v, etf)]) // n
-                    k = min(k, etf_room)
-                    for tk in basket:
-                        v, _, _ = const_bid[tk]
-                        room = self.pos[(v, tk)] - SOFT_POS_MIN
-                        k = min(k, room)
-                    cash_room = ((self.cash[etf_v] - SOFT_CASH_FLOOR) // (n * etf_buy_px)
-                                 if etf_buy_px > 0 else 0)
-                    k = min(k, cash_room, ARB_MAX_K)
-                    k = max(0, int(k * taper))
-                    if k > 0:
-                        legs = [Leg(etf_v, etf, "bid", k * n, etf_buy_px,
-                                    note=f"etfarb_buy_{etf}@{etf_v}")]
-                        for tk in basket:
-                            v, px, _ = const_bid[tk]
-                            legs.append(Leg(v, tk, "ask", k, px, note=f"etfarb_sell_{tk}@{v}"))
-                        out.append(Plan(legs, edge_cents=edge_a,
-                                        strategy=f"ETF-NAV {etf}@{etf_v} long"))
-
-                # Direction B: ETF rich → sell ETF, buy basket
-                etf_sell_px = bk.best_bid
-                etf_sell_qty = bk.best_bid_qty
-                synth_buy_total = sum(const_ask[tk][1] for tk in basket)
-                edge_b = etf_sell_px - synth_buy_total / n
-                if edge_b > 0:
-                    self.spread_tracker.record("ETF_SELL", etf, edge_b)
-                threshold = self.spread_tracker.threshold("ETF_SELL", etf, BASE_ARB_EDGE)
-
-                if edge_b >= threshold:
-                    taper = self.inventory_taper(etf_v, etf, "ask")
-                    k = etf_sell_qty // n
-                    for tk in basket:
-                        k = min(k, const_ask[tk][2])
-                    etf_short_room = self.pos[(etf_v, etf)] - SOFT_POS_MIN
-                    k = min(k, etf_short_room // n)
-                    for tk in basket:
-                        v, px, _ = const_ask[tk]
-                        room = (SOFT_POS_MAX - self.pos[(v, tk)])
-                        k = min(k, room)
-                    venue_buy_cost: dict[str, int] = defaultdict(int)
-                    for tk in basket:
-                        v, px, _ = const_ask[tk]
-                        venue_buy_cost[v] += px
-                    for v, per_k_cost in venue_buy_cost.items():
-                        if per_k_cost == 0:
-                            continue
-                        room = (self.cash[v] - SOFT_CASH_FLOOR) // per_k_cost
-                        k = min(k, room)
-                    k = min(k, ARB_MAX_K)
-                    k = max(0, int(k * taper))
-                    if k > 0:
-                        legs = [Leg(etf_v, etf, "ask", k * n, etf_sell_px,
-                                    note=f"etfarb_sell_{etf}@{etf_v}")]
-                        for tk in basket:
-                            v, px, _ = const_ask[tk]
-                            legs.append(Leg(v, tk, "bid", k, px, note=f"etfarb_buy_{tk}@{v}"))
-                        out.append(Plan(legs, edge_cents=edge_b,
-                                        strategy=f"ETF-NAV {etf}@{etf_v} short"))
-        return out
-
-    # ─── strategy 2: sub-ETF arb (with adaptive threshold) ───────────
-    def sub_etf_arbs(self) -> list[Plan]:
-        out: list[Plan] = []
-        for super_etf, (sub_etf, complement) in SUB_ETF_LINKS.items():
-            sup_venues = [v for v in LISTINGS[super_etf] if v in self.active_venues]
-            sub_venues = [v for v in LISTINGS[sub_etf]   if v in self.active_venues]
-            if not sup_venues or not sub_venues:
-                continue
-            comp_bid: dict[str, tuple[str, int, int]] = {}
-            comp_ask: dict[str, tuple[str, int, int]] = {}
-            ok = True
-            for tk in complement:
-                bb = self._best_sell_venue(tk)
-                ba = self._best_buy_venue(tk)
-                if bb is None or ba is None:
-                    ok = False; break
-                comp_bid[tk] = bb
-                comp_ask[tk] = ba
-            if not ok:
-                continue
-
-            def best_quote(tk, venues, side):
-                best = None
-                for v in venues:
-                    bk = self.books[(v, tk)]
-                    px = bk.best_ask if side == "bid" else bk.best_bid
-                    qty = bk.best_ask_qty if side == "bid" else bk.best_bid_qty
-                    if px is None: continue
-                    if best is None or (px < best[1] if side == "bid" else px > best[1]):
-                        best = (v, px, qty)
-                return best
-
-            sup_buy = best_quote(super_etf, sup_venues, "bid")
-            sup_sell = best_quote(super_etf, sup_venues, "ask")
-            sub_buy = best_quote(sub_etf, sub_venues, "bid")
-            sub_sell = best_quote(sub_etf, sub_venues, "ask")
-            if not (sup_buy and sup_sell and sub_buy and sub_sell):
-                continue
-
-            # Direction A: super cheap → long super, short sub + complement
-            edge_a = 3*sub_buy[1] + sum(comp_bid[tk][1] for tk in complement) - 6*sup_buy[1]
-            edge_a_per_share = edge_a / 6
-            if edge_a > 0:
-                self.spread_tracker.record("SUB_ETF_A", super_etf, edge_a_per_share)
-            thr = self.spread_tracker.threshold("SUB_ETF_A", super_etf, BASE_SUB_ETF_EDGE)
-            if edge_a_per_share >= thr:
-                taper = self.inventory_taper(sup_buy[0], super_etf, "bid")
-                k = min(
-                    sup_buy[2] // 6, sub_buy[2] // 3,
-                    *(comp_bid[tk][2] for tk in complement),
-                    (SOFT_POS_MAX - self.pos[(sup_buy[0], super_etf)]) // 6,
-                    (self.pos[(sub_buy[0], sub_etf)] - SOFT_POS_MIN) // 3,
-                    *((self.pos[(comp_bid[tk][0], tk)] - SOFT_POS_MIN) for tk in complement),
-                    (self.cash[sup_buy[0]] - SOFT_CASH_FLOOR) // (6 * sup_buy[1]) if sup_buy[1] else 0,
-                    ARB_MAX_K,
-                )
-                k = max(0, int(k * taper))
-                if k > 0:
-                    legs = [
-                        Leg(sup_buy[0], super_etf, "bid", 6*k, sup_buy[1], note=f"sub_long_{super_etf}"),
-                        Leg(sub_buy[0], sub_etf,   "ask", 3*k, sub_buy[1], note=f"sub_short_{sub_etf}"),
-                    ]
-                    for tk in complement:
-                        v, px, _ = comp_bid[tk]
-                        legs.append(Leg(v, tk, "ask", k, px, note=f"sub_short_{tk}"))
-                    out.append(Plan(legs, edge_cents=edge_a_per_share,
-                                    strategy=f"SUB-ETF {super_etf}/{sub_etf} long"))
-
-            # Direction B: super rich
-            edge_b = 6*sup_sell[1] - 3*sub_sell[1] - sum(comp_ask[tk][1] for tk in complement)
-            edge_b_per_share = edge_b / 6
-            if edge_b > 0:
-                self.spread_tracker.record("SUB_ETF_B", super_etf, edge_b_per_share)
-            thr = self.spread_tracker.threshold("SUB_ETF_B", super_etf, BASE_SUB_ETF_EDGE)
-            if edge_b_per_share >= thr:
-                taper = self.inventory_taper(sup_sell[0], super_etf, "ask")
-                buys_per_k_per_venue: dict[str, int] = defaultdict(int)
-                buys_per_k_per_venue[sub_sell[0]] += 3 * sub_sell[1]
-                for tk in complement:
-                    v, px, _ = comp_ask[tk]
-                    buys_per_k_per_venue[v] += px
-                cash_k = ARB_MAX_K
-                for v, per_k_cost in buys_per_k_per_venue.items():
-                    if per_k_cost > 0:
-                        cash_k = min(cash_k, (self.cash[v] - SOFT_CASH_FLOOR) // per_k_cost)
-                k = min(
-                    sup_sell[2] // 6, sub_sell[2] // 3,
-                    *(comp_ask[tk][2] for tk in complement),
-                    (self.pos[(sup_sell[0], super_etf)] - SOFT_POS_MIN) // 6,
-                    (SOFT_POS_MAX - self.pos[(sub_sell[0], sub_etf)]) // 3,
-                    *((SOFT_POS_MAX - self.pos[(comp_ask[tk][0], tk)]) for tk in complement),
-                    cash_k, ARB_MAX_K,
-                )
-                k = max(0, int(k * taper))
-                if k > 0:
-                    legs = [
-                        Leg(sup_sell[0], super_etf, "ask", 6*k, sup_sell[1], note=f"sub_short_{super_etf}"),
-                        Leg(sub_sell[0], sub_etf,   "bid", 3*k, sub_sell[1], note=f"sub_long_{sub_etf}"),
-                    ]
-                    for tk in complement:
-                        v, px, _ = comp_ask[tk]
-                        legs.append(Leg(v, tk, "bid", k, px, note=f"sub_long_{tk}"))
-                    out.append(Plan(legs, edge_cents=edge_b_per_share,
-                                    strategy=f"SUB-ETF {super_etf}/{sub_etf} short"))
-        return out
-
-    # ─── strategy 3: cross-venue arb (with depth walking + adaptive) ─
-    def cross_venue_arbs(self) -> list[Plan]:
-        out: list[Plan] = []
-        for tk in LISTINGS:
-            venues = [v for v in LISTINGS[tk] if v in self.active_venues]
-            if len(venues) < 2:
-                continue
-
-            # Find best bid (sell into) and best ask (buy from) across all venues
-            best_b = best_a = None
-            for v in venues:
-                bk = self.books[(v, tk)]
-                if bk.best_bid is not None and (best_b is None or bk.best_bid > best_b[1]):
-                    best_b = (v, bk.best_bid, bk.best_bid_qty)
-                if bk.best_ask is not None and (best_a is None or bk.best_ask < best_a[1]):
-                    best_a = (v, bk.best_ask, bk.best_ask_qty)
-            if not best_b or not best_a or best_b[0] == best_a[0]:
-                continue
-
-            # Use microprice for signal direction in close cases — if mid says
-            # spread is 5¢ but microprice says it's flipped, skip.
-            top_edge = best_b[1] - best_a[1]
-            if top_edge <= 0:
-                continue
-
-            # Record observed spread for this ticker for adaptive learning
-            self.spread_tracker.record("XV", tk, top_edge)
-            threshold = self.spread_tracker.threshold("XV", tk, BASE_XV_EDGE)
-
-            if top_edge < threshold:
-                continue
-
-            # Depth walk: find total qty available within DEPTH_WALK_CENTS of best
-            buy_v, buy_px_top, _ = best_a
-            sell_v, sell_px_top, _ = best_b
-            buy_book = self.books[(buy_v, tk)]
-            sell_book = self.books[(sell_v, tk)]
-
-            # We need: qty at buy_book.asks ≤ some price AND qty at sell_book.bids ≥ some price
-            # such that the worst paired execution still has edge ≥ threshold.
-            buy_limit = buy_px_top + DEPTH_WALK_CENTS
-            sell_limit = sell_px_top - DEPTH_WALK_CENTS
-            buy_qty, buy_avg = buy_book.buy_depth_to(buy_limit)
-            sell_qty, sell_avg = sell_book.sell_depth_to(sell_limit)
-            if buy_avg is None or sell_avg is None:
-                continue
-            walked_edge = sell_avg - buy_avg
-            if walked_edge < threshold:
-                # Fall back to L1 only
-                buy_qty = best_a[2]
-                sell_qty = best_b[2]
-                buy_px = buy_px_top
-                sell_px = sell_px_top
-                walked_edge = top_edge
-            else:
-                buy_px = buy_limit  # IOC up to this price
-                sell_px = sell_limit
-
-            qty = min(buy_qty, sell_qty, XV_MAX_QTY)
-
-            # Inventory taper on both sides
-            taper_buy = self.inventory_taper(buy_v, tk, "bid")
-            taper_sell = self.inventory_taper(sell_v, tk, "ask")
-            taper = min(taper_buy, taper_sell)
-            qty = max(0, int(qty * taper))
-
-            qty = min(qty, SOFT_POS_MAX - self.pos[(buy_v, tk)])
-            qty = min(qty, self.pos[(sell_v, tk)] - SOFT_POS_MIN)
-            if buy_px > 0:
-                qty = min(qty, (self.cash[buy_v] - SOFT_CASH_FLOOR) // buy_px)
-            if qty > 0:
-                out.append(Plan(
-                    [Leg(buy_v, tk, "bid", qty, buy_px, note=f"xv_buy_{tk}@{buy_v}"),
-                     Leg(sell_v, tk, "ask", qty, sell_px, note=f"xv_sell_{tk}@{sell_v}")],
-                    edge_cents=walked_edge,
-                    strategy=f"X-VENUE {tk} {buy_v}->{sell_v}",
-                ))
-        return out
-
-    # ─── strategy 5: settlement-aware unwind (unchanged) ─────────────
-    def settlement_unwind(self) -> list[Plan]:
-        out: list[Plan] = []
-        for ex in self.active_venues:
-            t = self.server_time.get(ex)
-            length = self.round_length.get(ex, DEFAULT_ROUND_MS)
-            if t is None or length is None:
-                continue
-            remaining = length - t
-            if remaining <= 0 or remaining > EOS_UNWIND_MS:
-                continue
-            urgency = 1.0 - remaining / EOS_UNWIND_MS
-            for (ex2, tk), pos in list(self.pos.items()):
-                if ex2 != ex or pos == 0:
-                    continue
-                bk = self.books.get((ex, tk))
-                if bk is None:
-                    continue
-                target_qty = abs(pos)
-                aggressive = remaining <= EOS_FLATTEN_MS
-                if pos > 0:
-                    bb = bk.best_bid
-                    if bb is None: continue
-                    qty = min(target_qty, bk.best_bid_qty,
-                              max(1, int(target_qty * (urgency if not aggressive else 1.0))))
-                    px = bb if not aggressive else max(1, bb - 5)
-                    out.append(Plan(
-                        [Leg(ex, tk, "ask", qty, px, note=f"unwind_long_{tk}")],
-                        edge_cents=0.0, strategy=f"UNWIND long {tk}@{ex}",
-                    ))
-                else:
-                    ba = bk.best_ask
-                    if ba is None: continue
-                    qty = min(target_qty, bk.best_ask_qty,
-                              max(1, int(target_qty * (urgency if not aggressive else 1.0))))
-                    px = ba if not aggressive else ba + 5
-                    out.append(Plan(
-                        [Leg(ex, tk, "bid", qty, px, note=f"unwind_short_{tk}")],
-                        edge_cents=0.0, strategy=f"UNWIND short {tk}@{ex}",
-                    ))
-        return out
-
-    # ─── strategy 4: passive MM (microprice for skew) ────────────────
-    def passive_mm_refresh(self) -> None:
-        now = time.monotonic()
-        for tk in MM_INSTRUMENTS:
-            for v in LISTINGS.get(tk, set()):
-                if v not in self.active_venues or not self.ready.get(v, False):
-                    continue
-                key = (v, tk)
-                if now - self.last_mm_refresh[key] < MM_REFRESH_S:
-                    continue
-                self.last_mm_refresh[key] = now
-                bk = self.books[key]
-                bb, ba = bk.best_bid, bk.best_ask
-                if bb is None or ba is None or ba - bb < 2 * MM_INSIDE_TICK + 1:
-                    continue
-                pos = self.pos[key]
-
-                # NEW: microprice-aware skew. If microprice > mid, market is buying;
-                # quote slightly higher on both sides (hit our ask less, fill bid less,
-                # but at better prices on the bid).
-                mp = bk.microprice
-                m = bk.mid
-                skew = 0
-                if mp is not None and m is not None:
-                    if mp > m + 1:    # buying pressure
-                        skew = 1
-                    elif mp < m - 1:  # selling pressure
-                        skew = -1
-
-                bid_px = bb + MM_INSIDE_TICK + max(0, skew)
-                ask_px = ba - MM_INSIDE_TICK + min(0, skew)
-                if bid_px >= ask_px:
-                    continue
-
-                have_bid_at_px = have_ask_at_px = False
-                stale_oids: list[int] = []
-                for oid, (ex0, tk0, side0, _q0, px0) in self.live_orders.items():
-                    if ex0 != v or tk0 != tk: continue
-                    if side0 == "bid" and px0 == bid_px:
-                        have_bid_at_px = True
-                    elif side0 == "ask" and px0 == ask_px:
-                        have_ask_at_px = True
-                    else:
-                        stale_oids.append(oid)
-                conn = self.connections.get(v)
-                if conn and conn.connected:
-                    for oid in stale_oids:
-                        conn.enqueue({
-                            "type": "cancel_order",
-                            "user_request_id": self.req_id(f"cxl-{tk}"),
-                            "order_id": oid,
-                            "instrument_id": f"{v}-{tk}",
-                        })
-
-                # Inventory-tapered MM size
-                buy_taper = self.inventory_taper(v, tk, "bid")
-                sell_taper = self.inventory_taper(v, tk, "ask")
-                buy_qty = max(1, int(MM_QTY * buy_taper))
-                sell_qty = max(1, int(MM_QTY * sell_taper))
-
-                if (not have_bid_at_px
-                        and pos < SOFT_POS_MAX - buy_qty
-                        and self.cash[v] - buy_qty * bid_px > SOFT_CASH_FLOOR):
-                    leg = Leg(v, tk, "bid", buy_qty, bid_px,
-                              order_type="limit", note=f"mm_bid_{tk}", strategy="MM")
-                    self.fire_one(leg)
-                if not have_ask_at_px and pos > SOFT_POS_MIN + sell_qty:
-                    leg = Leg(v, tk, "ask", sell_qty, ask_px,
-                              order_type="limit", note=f"mm_ask_{tk}", strategy="MM")
-                    self.fire_one(leg)
+        return False
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Connection (unchanged from v1)
-# ════════════════════════════════════════════════════════════════════════════
-
-class Connection:
-    def __init__(self, hub: Hub, exchange: str):
-        self.hub = hub
-        self.exchange = exchange
-        self.url = f"ws://{WS_HOSTS[exchange]}:9001/trade"
-        self.ws = None
-        self.send_q: asyncio.Queue[dict] = asyncio.Queue(maxsize=2000)
-        self.connected = False
-
-    def enqueue(self, msg: dict) -> None:
-        try:
-            self.send_q.put_nowait(msg)
-        except asyncio.QueueFull:
-            log.warning("%s send queue full, dropping %s", self.exchange, msg.get("type"))
+class RailEdgeBot:
+    def __init__(
+        self,
+        configs: dict[str, RailConfig],
+        *,
+        rate_limit: int = 450,
+        order_ttl_ms: int = DEFAULT_ORDER_TTL_MS,
+        inventory_every_ms: int = 1_000,
+    ) -> None:
+        self.configs = configs
+        self.rate_limit = rate_limit
+        self.order_ttl_ms = order_ttl_ms
+        self.inventory_every_ms = inventory_every_ms
 
     async def run(self) -> None:
-        backoff = 0.1
-        while not self.hub.stop:
-            try:
-                async with ws_connect(self.url, open_timeout=5, ping_interval=20,
-                                      ping_timeout=10, max_size=2**24) as ws:
-                    self.ws = ws
-                    self.connected = True
-                    backoff = 0.1
-                    raw = await asyncio.wait_for(ws.recv(), timeout=10)
-                    welcome = json.loads(raw)
-                    if welcome.get("type") != "welcome":
-                        log.warning("%s unexpected first msg: %s", self.exchange, welcome)
-                    self.hub.on_welcome(self.exchange)
-                    sender = asyncio.create_task(self._sender_loop(ws), name=f"snd-{self.exchange}")
-                    try:
-                        await self._receiver_loop(ws)
-                    finally:
-                        sender.cancel()
-                        with contextlib.suppress(BaseException):
-                            await sender
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.warning("%s connection error: %s", self.exchange, e)
-            finally:
-                self.connected = False
-                self.ws = None
-            if self.hub.stop:
-                return
-            while not self.send_q.empty():
-                try: self.send_q.get_nowait()
-                except: break
-            jitter = random.uniform(0.0, 0.2)
-            await asyncio.sleep(min(MAX_BACKOFF_S, backoff) + jitter)
-            backoff = min(MAX_BACKOFF_S, backoff * 1.7)
+        await asyncio.gather(
+            *(self._run_exchange(exchange, config) for exchange, config in self.configs.items())
+        )
 
-    async def _receiver_loop(self, ws) -> None:
-        async for raw in ws:
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                log.warning("%s text frame: %r", self.exchange, raw[:80])
-                continue
-            mtype = msg.get("type", "")
-            if mtype == "market_data_update":
-                self.hub.on_md(self.exchange, msg)
-                self.hub.req_inventory(self.exchange)
-                self.hub.strategize()
-            elif mtype == "add_order_response":
-                self.hub.on_add_order_response(self.exchange, msg)
-            elif mtype == "cancel_order_response":
-                self.hub.on_cancel_order_response(self.exchange, msg)
-            elif mtype == "get_inventory_response":
-                self.hub.on_inventory(self.exchange, msg)
-            elif mtype == "get_pending_orders_response":
-                self.hub.on_pending_orders(self.exchange, msg)
-            elif mtype == "end_of_round":
-                log.info("%s end_of_round", self.exchange)
-                return
-            elif mtype == "error":
-                log.warning("%s server error: %s", self.exchange, msg.get("message"))
+    async def _run_exchange(self, exchange: str, config: RailConfig) -> None:
+        if websockets is None:
+            raise RuntimeError("Install requirements.txt before running the live bot.")
 
-    async def _sender_loop(self, ws) -> None:
+        url = f"ws://{exchange.lower()}.algotrade.hr:9001/trade"
+        backoff = 1.0
         while True:
-            msg = await self.send_q.get()
-            await self.hub.buckets[self.exchange].acquire()
+            state = ExchangeState(exchange=exchange)
+            strategy = RailEdgeStrategy(config)
+            limiter = TokenBucket(self.rate_limit, burst=min(self.rate_limit, 100))
+            pending: dict[str, PendingOrder] = {}
+            next_inventory_ms = 0
+            seq = 0
             try:
-                await ws.send(json.dumps(msg, separators=(",", ":")))
-            except Exception as e:
-                log.warning("%s send failed: %s", self.exchange, e)
-                return
+                async with websockets.connect(url, max_size=16 * 1024 * 1024) as ws:
+                    print(f"[{exchange}] connected {url}", flush=True)
+                    backoff = 1.0
+                    # On (re)connect, ask for both inventory and any orders
+                    # already resting on the server. The pending-orders sync
+                    # is critical: rail bids carried over from a previous
+                    # session would otherwise appear as server-reserved cash
+                    # we don't know about, leading to "insufficient balance"
+                    # when we try to add new bids.
+                    await self._send_json(
+                        ws, limiter,
+                        {"type": "get_inventory", "user_request_id": f"{exchange}-inventory-0"},
+                    )
+                    await self._send_json(
+                        ws, limiter,
+                        {"type": "get_pending_orders", "user_request_id": f"{exchange}-pending-0"},
+                    )
 
+                    async for raw in ws:
+                        if raw == "Message rate limit exceeded":
+                            raise RuntimeError(raw)
+                        message = json.loads(raw)
+                        msg_type = message.get("type")
 
-# ════════════════════════════════════════════════════════════════════════════
-# Main
-# ════════════════════════════════════════════════════════════════════════════
+                        if msg_type == "end_of_round":
+                            print(f"[{exchange}] end_of_round", flush=True)
+                            break
 
-async def amain(active_venues: list[str]) -> None:
-    hub = Hub(active_venues)
-    for ex in active_venues:
-        hub.connections[ex] = Connection(hub, ex)
+                        if msg_type == "get_inventory_response":
+                            state.apply_inventory(message.get("data", {}))
+                            continue
 
-    loop = asyncio.get_running_loop()
-    def shutdown():
-        log.info("shutdown signal received")
-        hub.stop = True
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, shutdown)
+                        if msg_type == "get_pending_orders_response":
+                            self._hydrate_live_orders(state, message.get("data", {}))
+                            continue
 
-    tasks = [asyncio.create_task(c.run(), name=f"conn-{ex}")
-             for ex, c in hub.connections.items()]
+                        if msg_type == "add_order_response":
+                            had_immediate_fill = self._handle_add_order_response(
+                                exchange, state, strategy, pending, message
+                            )
+                            if had_immediate_fill:
+                                # Re-sync BOTH inventory and pending orders —
+                                # a fill or rejection means our local
+                                # reserved_cash / reserved_qty are now stale
+                                # relative to the server.
+                                seq += 1
+                                await self._send_json(
+                                    ws, limiter,
+                                    {"type": "get_inventory",
+                                     "user_request_id": f"{exchange}-{seq}-postfill"},
+                                )
+                                seq += 1
+                                await self._send_json(
+                                    ws, limiter,
+                                    {"type": "get_pending_orders",
+                                     "user_request_id": f"{exchange}-{seq}-postfill-pend"},
+                                )
+                            continue
 
-    async def tick():
-        while not hub.stop:
-            await asyncio.sleep(0.1)
-            try:
-                hub.strategize()
-            except Exception as e:
-                log.exception("strategize error: %s", e)
-    tasks.append(asyncio.create_task(tick(), name="tick"))
+                        if msg_type != "market_data_update":
+                            continue
 
-    try:
-        while not hub.stop:
-            await asyncio.sleep(0.5)
-    finally:
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-    log.info("done")
+                        now_ms = int(message.get("time", 0))
+                        for event in message.get("events", []):
+                            if event.get("event_type") == "trade":
+                                strategy.apply_trade_event(state, event)
+                            elif event.get("event_type") == "cancel":
+                                data = event.get("data", {})
+                                order_id = data.get("orderID")
+                                if order_id is not None:
+                                    state.drop_order(int(order_id))
+
+                        depths = message.get("orderbook_depths", {})
+                        depth = depths.get(config.instrument)
+                        planned = strategy.plan_orders(state, depth, now_ms)
+                        for order in planned:
+                            seq += 1
+                            request_id = f"{exchange}-{seq}-{order['role']}"
+                            pending_order = PendingOrder(
+                                local_id=request_id,
+                                instrument=order["instrument_id"],
+                                side=order["side"],
+                                price=order["price"],
+                                quantity=order["quantity"],
+                                order_type=order["order_type"],
+                                role=order["role"],
+                            )
+                            pending[request_id] = pending_order
+                            state.track_inflight(pending_order)
+                            await self._send_json(
+                                ws,
+                                limiter,
+                                build_add_order(
+                                    request_id=request_id,
+                                    instrument_id=order["instrument_id"],
+                                    side=order["side"],
+                                    price=order["price"],
+                                    quantity=order["quantity"],
+                                    order_type=order["order_type"],
+                                    ttl_ms=self.order_ttl_ms,
+                                ),
+                            )
+
+                        if now_ms >= next_inventory_ms:
+                            seq += 1
+                            next_inventory_ms = now_ms + self.inventory_every_ms
+                            await self._send_json(
+                                ws,
+                                limiter,
+                                {
+                                    "type": "get_inventory",
+                                    "user_request_id": f"{exchange}-{seq}-inventory",
+                                },
+                            )
+
+            except (OSError, websockets.WebSocketException, RuntimeError, json.JSONDecodeError) as exc:
+                print(f"[{exchange}] disconnected: {exc}", flush=True)
+
+            await asyncio.sleep(backoff)
+            backoff = min(10.0, backoff * 1.5)
+
+    def _handle_add_order_response(
+        self,
+        exchange: str,
+        state: ExchangeState,
+        strategy: RailEdgeStrategy,
+        pending: dict[str, PendingOrder],
+        message: dict[str, Any],
+    ) -> bool:
+        """Returns True iff the response carried an immediate fill that
+        changed our cash view (caller should re-poll inventory)."""
+        request_id = message.get("user_request_id")
+        order = pending.pop(request_id, None)
+        state.drop_inflight(request_id)
+        if order is None:
+            return False
+
+        data = message.get("data", {})
+        if not message.get("success"):
+            msg = (data or {}).get("message") if isinstance(data, dict) else None
+            print(f"[{exchange}] add_order failed: {msg}", flush=True)
+            return True
+
+        had_fill = bool(
+            data.get("immediate_inventory_change")
+            or data.get("immediate_balance_change")
+        )
+
+        if order.role == "rail":
+            # Rail orders may also have crossed at placement (rare for $70
+            # bids but possible for the $110 short-rail when the touch is
+            # crossed). Apply that fill before tracking the resting remainder.
+            if had_fill:
+                strategy.apply_immediate_fill(state, order, data)
+            order_id = data.get("order_id")
+            if order_id is not None:
+                inv_change = int(data.get("immediate_inventory_change") or 0)
+                resting_qty = max(0, order.quantity - abs(inv_change))
+                if resting_qty > 0:
+                    state.track_order(
+                        local_id=order.local_id,
+                        order_id=int(order_id),
+                        instrument=order.instrument,
+                        side=order.side,
+                        price=int(order.price or 0),
+                        quantity=resting_qty,
+                        role=order.role,
+                    )
+        else:
+            strategy.apply_immediate_fill(state, order, data)
+        return had_fill
+
+    def _hydrate_live_orders(self, state: ExchangeState, data: dict[str, Any]) -> None:
+        """Repopulate live_orders from a get_pending_orders_response so our
+        local view matches what the server has resting. Without this, any
+        rail order that survived a reconnect would be invisible to
+        pending_bid_value() and we'd over-deploy cash."""
+        state.pending_orders_synced = True
+        for instrument, sides in (data or {}).items():
+            if not isinstance(sides, list) or len(sides) != 2:
+                continue
+            bid_orders, ask_orders = sides
+            for side_name, group in (("bid", bid_orders), ("ask", ask_orders)):
+                for entry in group or []:
+                    try:
+                        oid = int(entry["orderID"])
+                        price = int(entry["price"])
+                        unfilled = int(entry["unfilled_quantity"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if unfilled <= 0:
+                        continue
+                    state.live_orders[oid] = LiveOrder(
+                        local_id=f"hydrated-{oid}",
+                        order_id=oid,
+                        instrument=instrument,
+                        side=side_name,
+                        price=price,
+                        remaining=unfilled,
+                        role="rail",
+                    )
+
+    @staticmethod
+    async def _send_json(ws: Any, limiter: TokenBucket, payload: dict[str, Any]) -> None:
+        while not limiter.try_take():
+            await asyncio.sleep(0.002)
+        await ws.send(json.dumps(payload, separators=(",", ":")))
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--venues", default=",".join(VENUES),
-                   help="Comma-separated venue subset")
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description="Run the AlgoTrade rail edge bot.")
+    parser.add_argument(
+        "--exchanges",
+        default=",".join(EXCHANGES),
+        help="Comma-separated exchanges to trade; default is all configured exchanges.",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=int,
+        default=450,
+        help="Client-side messages per second per exchange, below the 500 hard cap.",
+    )
+    parser.add_argument(
+        "--order-ttl-ms",
+        type=int,
+        default=DEFAULT_ORDER_TTL_MS,
+        help="Expiry horizon for resting rail orders and IOC requests.",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    active = [v.strip().upper() for v in args.venues.split(",") if v.strip()]
-    bad = [v for v in active if v not in VENUES]
-    if bad:
-        raise SystemExit(f"unknown venue(s): {bad} (valid: {VENUES})")
-    log.info("starting prism2 on venues: %s", active)
-    try:
-        asyncio.run(amain(active))
-    except KeyboardInterrupt:
-        pass
+    wanted = {item.strip() for item in args.exchanges.split(",") if item.strip()}
+    configs = {
+        exchange: config
+        for exchange, config in default_rail_configs().items()
+        if exchange in wanted
+    }
+    if not configs:
+        raise SystemExit("No configured exchanges selected.")
+
+    bot = RailEdgeBot(
+        configs,
+        rate_limit=args.rate_limit,
+        order_ttl_ms=args.order_ttl_ms,
+    )
+    asyncio.run(bot.run())
 
 
 if __name__ == "__main__":
