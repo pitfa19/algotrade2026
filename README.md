@@ -13,14 +13,20 @@ In the last 30 s of a segment we stop opening and flatten residuals at market.
 
 ## Run on the team VM
 
+The VM ships with PEP-668-managed Python 3.13, so install into a venv:
+
 ```sh
-ssh root@vm.algotrade.hr     # password: algotrade
-git pull origin fabijan
+ssh root@vm.algotrade.hr                      # password: algotrade
+cd ~/algotrade2026 && git pull origin fabijan
+
+apt install -y python3.13-venv                # one-time
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 
 tmux new -s bot
 python bot.py
-# detach with Ctrl-b d
+# detach with Ctrl-b d; reattach with `tmux attach -t bot`
 ```
 
 `LOG_LEVEL=DEBUG` for verbose order logs. `ZSE_HOST` overrides the host (e.g.
