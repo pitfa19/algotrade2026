@@ -86,28 +86,28 @@ CASH_FLOOR         = -5_000_000
 MAX_PENDING_ORDERS =  6_000
 SERVER_RATE_PER_S  =    500
 
-RATE_PER_S         =    400
-SOFT_POS_MAX       =  1_800
-SOFT_POS_MIN       =   -180
-SOFT_CASH_FLOOR    = -4_500_000
+RATE_PER_S         =    450
+SOFT_POS_MAX       =  1_950
+SOFT_POS_MIN       =   -195
+SOFT_CASH_FLOOR    = -4_900_000
 
 # Cross-venue base threshold — adaptive layer only widens, never tightens.
-BASE_XV_EDGE       =      4
+BASE_XV_EDGE       =      2
 
 ADAPT_WINDOW_SECONDS =     5.0
-ADAPT_QUANTILE       =     0.30
+ADAPT_QUANTILE       =     0.10
 ADAPT_MIN_SAMPLES    =    20
 
-TAPER_START_FRAC   =      0.5
-TAPER_END_FRAC     =      0.95
+TAPER_START_FRAC   =      0.80
+TAPER_END_FRAC     =      0.97
 
-DEPTH_WALK_CENTS   =     20
-CROSS_CLUSTER_DRIFT_CENTS = 3
+DEPTH_WALK_CENTS   =     30
+CROSS_CLUSTER_DRIFT_CENTS = 1
 
-XV_MAX_QTY         =    100
+XV_MAX_QTY         =    500
 MM_INSIDE_TICK     =      1
-MM_QTY             =      4
-MM_REFRESH_S       =      1.5
+MM_QTY             =     25
+MM_REFRESH_S       =      0.5
 MM_INSTRUMENTS     = ["CARD", "SIMP"]
 
 DEFAULT_ROUND_MS   = 600_000
