@@ -1,10 +1,10 @@
-# AlgoTrade 2026 — WebSocket API Reference¶
+# AlgoTrade 2026 — WebSocket API Reference
 
 Complete documentation for the exchange WebSocket API. All trading and market data flows through a single WebSocket connection.
 
 * * *
 
-## Table of Contents¶
+## Table of Contents
 
   * Connection
   * Endpoint
@@ -55,24 +55,19 @@ Complete documentation for the exchange WebSocket API. All trading and market da
   * JavaScript
   * Error Reference
 
-
-
 * * *
 
-## Connection¶
+## Connection
 
-### Endpoint¶
-    
-    
+### Endpoint
     ws://<host>:9001/trade
     
-
 Parameter | Default | Description  
 ---|---|---  
 `host` | — | Exchange hostname or IP (see participant guide §7)  
 port | `9001` | Fixed  
   
-### Authentication¶
+### Authentication
 
 On the venue network, authentication is **automatic** — the server identifies your team by the source IP of the connection. There is no token to send and no login message. Open the WebSocket and you are in.
 
@@ -83,14 +78,14 @@ Unrecognised source IP | `401 Unauthorized` | Client IP does not map to any regi
 Open rate exceeded | `429 Too Many Requests` | Too many connection attempts per second  
 Connection cap reached | `429 Too Many Requests` | Team already has maximum concurrent connections  
   
-### Connection Limits¶
+### Connection Limits
 
 Limit | Value | Description  
 ---|---|---  
 Max connections per team | **10** | Concurrent WebSocket connections per team  
 Connection opens per team/second | **10** | Maximum new connections a team can open per second  
   
-### Rate Limits¶
+### Rate Limits
 
 Limit | Value | Window | Description  
 ---|---|---|---  
@@ -98,7 +93,7 @@ Messages per team per second | **500** | 1000 ms | Maximum messages a team can s
   
 Exceeding the message rate limit causes the server to send `"Message rate limit exceeded"` as a text frame and **immediately close** the WebSocket connection.
 
-### WebSocket Configuration¶
+### WebSocket Configuration
 
 Setting | Value | Description  
 ---|---|---  
@@ -112,19 +107,14 @@ Automatic pings | Yes | Server sends WebSocket pings to keep connections alive
   
 * * *
 
-## Message Protocol¶
+## Message Protocol
 
-### General Format¶
+### General Format
 
 All messages are JSON objects sent as WebSocket **text** frames. Every message has a `type` field identifying the message kind.
-    
-    
     { "type": "<message_type>", ... }
     
-
-### Message Flow¶
-    
-    
+### Message Flow
     Client                                            Server
       │                                                  │
       │──── WS upgrade (auto-auth by source IP) ────────>│
@@ -152,34 +142,28 @@ All messages are JSON objects sent as WebSocket **text** frames. Every message h
       │                                                  │
       │<──── end_of_round ───────────────────────────────│
     
-
 On connection open the client is automatically subscribed to the `market_data` pub/sub topic. Market data broadcasts arrive every **100 ms** without any explicit subscription request.
 
 * * *
 
-## Server → Client Messages¶
+## Server → Client Messages
 
-### Welcome Message¶
+### Welcome Message
 
 Sent immediately after a successful WebSocket upgrade.
-    
-    
     {
       "type": "welcome",
       "message": "Connected to OrderBook API"
     }
     
-
 Field | Type | Description  
 ---|---|---  
 `type` | string | Always `"welcome"`  
 `message` | string | Human-readable connection greeting  
   
-### Market Data Update (Broadcast)¶
+### Market Data Update (Broadcast)
 
 Pushed to **all connected clients** every **100 ms** (configurable via `PLAYER_UPDATE_MS`). Contains the full current market snapshot.
-    
-    
     {
       "type": "market_data_update",
       "time": 52300,
@@ -241,7 +225,6 @@ Pushed to **all connected clients** every **100 ms** (configurable via `PLAYER_U
       ]
     }
     
-
 Field | Type | Description  
 ---|---|---  
 `type` | string | Always `"market_data_update"`  
@@ -253,29 +236,24 @@ Field | Type | Description
   
 > **Note:** The `candles` field contains only **newly completed** candles — not the full history. The current in-progress candle is never included. The `events` array contains only events since the previous broadcast, not a full event log.
 
-### End of Round¶
+### End of Round
 
 Broadcast to all clients when the trading round ends and final settlement begins. In the competition this fires at the end of every 10-minute segment.
-    
-    
     {
       "type": "end_of_round"
     }
     
-
 After this message: \- No new orders can be placed (requests return an error). \- All open orders are automatically cancelled. \- Final settlement is performed (positions are marked to market). \- The exchange shuts down shortly after; your connection will close. A fresh exchange (with reset state) starts for the next segment — reconnect when it is up.
 
 * * *
 
-## Client → Server Requests¶
+## Client → Server Requests
 
 Every request must include a `type` field. Most requests should also include a `user_request_id` (a client-chosen string) so you can correlate responses.
 
-### Add Order¶
+### Add Order
 
 Place a new order on an instrument. Three order types are supported: `limit` (default), `ioc`, and `market`.
-    
-    
     {
       "type": "add_order",
       "user_request_id": "my-req-1",
@@ -287,7 +265,6 @@ Place a new order on an instrument. Three order types are supported: `limit` (de
       "order_type": "limit"
     }
     
-
 Field | Type | Required | Description  
 ---|---|---|---  
 `type` | string | Yes | Must be `"add_order"`  
@@ -311,11 +288,9 @@ Type | Behavior
 
 **Matching behavior:** When a new order is added, the engine immediately attempts to match it against resting orders on the opposite side (price-time priority). Any resulting trades are executed atomically. For `limit` orders the unfilled remainder rests on the book; for `ioc` and `market` it is cancelled.
 
-### Cancel Order¶
+### Cancel Order
 
 Cancel an existing live order.
-    
-    
     {
       "type": "cancel_order",
       "user_request_id": "my-req-2",
@@ -323,7 +298,6 @@ Cancel an existing live order.
       "instrument_id": "NYSE-CARD"
     }
     
-
 Field | Type | Required | Description  
 ---|---|---|---  
 `type` | string | Yes | Must be `"cancel_order"`  
@@ -333,33 +307,27 @@ Field | Type | Required | Description
   
 **Validation rules:** \- `order_id > 0` \- The order must exist and be live \- The order must belong to the requesting team \- If the round has ended, returns an error (all orders are auto-cancelled at round end)
 
-### Get Inventory¶
+### Get Inventory
 
 Request the team's current inventory (positions and cash balance).
-    
-    
     {
       "type": "get_inventory",
       "user_request_id": "my-req-3"
     }
     
-
 Field | Type | Required | Description  
 ---|---|---|---  
 `type` | string | Yes | Must be `"get_inventory"`  
 `user_request_id` | string | Yes | Client-generated correlation ID  
   
-### Get Pending Orders¶
+### Get Pending Orders
 
 Request all live (pending) orders for the team across all instruments.
-    
-    
     {
       "type": "get_pending_orders",
       "user_request_id": "my-req-4"
     }
     
-
 Field | Type | Required | Description  
 ---|---|---|---  
 `type` | string | Yes | Must be `"get_pending_orders"`  
@@ -367,17 +335,14 @@ Field | Type | Required | Description
   
 If the round has ended, returns an empty data set (all orders have been cancelled).
 
-### Get Market Data¶
+### Get Market Data
 
 Request the latest cached market data snapshot (identical format to the broadcast).
-    
-    
     {
       "type": "get_market_data",
       "user_request_id": "my-req-5"
     }
     
-
 Field | Type | Required | Description  
 ---|---|---|---  
 `type` | string | Yes | Must be `"get_market_data"`  
@@ -387,11 +352,9 @@ Returns a `market_data_update` message with `user_request_id` populated from the
 
 * * *
 
-## Response Types¶
+## Response Types
 
-### Add Order Response¶
-    
-    
+### Add Order Response
     {
       "type": "add_order_response",
       "user_request_id": "my-req-1",
@@ -404,7 +367,6 @@ Returns a `market_data_update` message with `user_request_id` populated from the
       }
     }
     
-
 Field | Type | Description  
 ---|---|---  
 `type` | string | Always `"add_order_response"`  
@@ -419,9 +381,7 @@ Field | Type | Description
 
 **On a fill at placement** (typical for IOC/market orders, or aggressive limit orders that cross), `immediate_inventory_change` and `immediate_balance_change` are populated. `immediate_inventory_change` is positive on a buy and negative on a sell; `immediate_balance_change` has the opposite sign. They are both `null` when the order rests without crossing.
 
-### Cancel Order Response¶
-    
-    
+### Cancel Order Response
     {
       "type": "cancel_order_response",
       "user_request_id": "my-req-2",
@@ -429,7 +389,6 @@ Field | Type | Description
       "message": null
     }
     
-
 Field | Type | Description  
 ---|---|---  
 `type` | string | Always `"cancel_order_response"`  
@@ -437,9 +396,7 @@ Field | Type | Description
 `success` | boolean | `true` if the order was cancelled  
 `message` | string | null | Error message (present on failure)  
   
-### Get Inventory Response¶
-    
-    
+### Get Inventory Response
     {
       "type": "get_inventory_response",
       "user_request_id": "my-req-3",
@@ -450,7 +407,6 @@ Field | Type | Description
       }
     }
     
-
 Field | Type | Description  
 ---|---|---  
 `type` | string | Always `"get_inventory_response"`  
@@ -467,11 +423,7 @@ Other | Instrument positions. `reserved` = units locked in pending ask orders. `
   * **Initial cash balance** is **10,000,000 cents** ($100,000) per team per exchange.
   * Positive `total` = long position; negative `total` = short position.
 
-
-
-### Get Pending Orders Response¶
-    
-    
+### Get Pending Orders Response
     {
       "type": "get_pending_orders_response",
       "user_request_id": "my-req-4",
@@ -507,7 +459,6 @@ Other | Instrument positions. `reserved` = units locked in pending ask orders. `
       }
     }
     
-
 Field | Type | Description  
 ---|---|---  
 `type` | string | Always `"get_pending_orders_response"`  
@@ -516,18 +467,15 @@ Field | Type | Description
   
 Each order in the arrays is an Order Object.
 
-### Error Response¶
+### Error Response
 
 Returned when a request fails parsing or an unknown command is sent.
-    
-    
     {
       "type": "error",
       "user_request_id": "",
       "message": "Unknown command type: foo"
     }
     
-
 Field | Type | Description  
 ---|---|---  
 `type` | string | Always `"error"`  
@@ -536,9 +484,9 @@ Field | Type | Description
   
 * * *
 
-## Data Types Reference¶
+## Data Types Reference
 
-### Scalar Types¶
+### Scalar Types
 
 All numeric values are **64-bit signed integers** (transmitted as JSON numbers).
 
@@ -551,7 +499,7 @@ Type Name | JSON Type | Description
 `Time_t` | integer | Time in milliseconds (server-relative or Unix epoch)  
 `InstrumentID_t` | string | Instrument identifier (e.g. `"NYSE-CARD"`)  
   
-### Order Object¶
+### Order Object
 
 Returned in `get_pending_orders_response`.
 
@@ -567,11 +515,9 @@ Field | Type | Description
 `total_quantity` | integer | Original order quantity  
 `live` | boolean | `true` if the order is still active on the book  
   
-### Orderbook Depth¶
+### Orderbook Depth
 
 Top 5 price levels on each side, per instrument.
-    
-    
     {
       "bids": {
         "10000": 25,
@@ -589,7 +535,6 @@ Top 5 price levels on each side, per instrument.
       }
     }
     
-
 Field | Type | Description  
 ---|---|---  
 `bids` | object `{ [price]: quantity }` | Aggregated quantities at the top 5 bid price levels  
@@ -601,13 +546,9 @@ Field | Type | Description
   * If fewer than 5 levels exist, only the available levels are returned.
   * An empty side is represented as `{}`.
 
-
-
-### Candle (OHLCV)¶
+### Candle (OHLCV)
 
 Candle data for tradeable instruments. Each candle represents **1 second** of real time (mapped from 1 "in-game hour").
-    
-    
     {
       "open": 10000,
       "close": 10020,
@@ -618,7 +559,6 @@ Candle data for tradeable instruments. Each candle represents **1 second** of re
       "index": 1740000
     }
     
-
 Field | Type | Description  
 ---|---|---  
 `open` | integer | null | First trade price in the candle period  
@@ -633,13 +573,9 @@ Field | Type | Description
   * A candle with no trades will have all OHLC fields as `null` and `volume` as `0` or `null`.
   * Candles are sent incrementally — only newly completed candles since the last broadcast are included.
 
-
-
-### Trade Event¶
+### Trade Event
 
 Occurs when two orders match.
-    
-    
     {
       "event_type": "trade",
       "data": {
@@ -652,7 +588,6 @@ Occurs when two orders match.
       }
     }
     
-
 Field | Type | Description  
 ---|---|---  
 `event_type` | string | Always `"trade"`  
@@ -663,11 +598,9 @@ Field | Type | Description
 `data.price` | integer | Execution price in cents  
 `data.time` | integer | Server time of the trade (ms)  
   
-### Cancel Event¶
+### Cancel Event
 
 Occurs when an order is cancelled (manually or by expiry).
-    
-    
     {
       "event_type": "cancel",
       "data": {
@@ -678,7 +611,6 @@ Occurs when an order is cancelled (manually or by expiry).
       }
     }
     
-
 Field | Type | Description  
 ---|---|---  
 `event_type` | string | Always `"cancel"`  
@@ -689,24 +621,22 @@ Field | Type | Description
   
 * * *
 
-## Market Data Details¶
+## Market Data Details
 
-### Broadcast Interval¶
+### Broadcast Interval
 
 Market data is broadcast to all subscribed clients every **100 ms** (`PLAYER_UPDATE_MS`).
 
 The broadcast is skipped if the round has not started yet (server time < 0) or if the round has ended.
 
-### Orderbook Depth Details¶
+### Orderbook Depth Details
 
   * **Depth:** Top **5 price levels** on each side (bid and ask).
   * **Aggregation:** Quantities at the same price level are summed.
   * **Coverage:** Published for **every tradeable instrument** on every broadcast, even if the book is empty.
   * Prices are serialized as **string keys** in the JSON object (due to JSON object key constraints), but represent integer values in cents.
 
-
-
-### Candle Aggregation¶
+### Candle Aggregation
 
   * **Period:** 1 candle = 1000 ms of server time (1 "in-game hour").
   * **Delivery:** Only newly **completed** candles are included in each broadcast. The current open candle is never sent.
@@ -714,9 +644,7 @@ The broadcast is skipped if the round has not started yet (server time < 0) or i
   * **Index:** The `index` field is an absolute sequential identifier for the candle period.
   * **Instrument filtering:** Candles are only included for instruments that have new completed candles. An instrument with no new candles is omitted from the `candles.tradeable` map.
 
-
-
-### Events¶
+### Events
 
 Events are **incremental** — each broadcast contains only events that occurred since the previous broadcast. Events are **not** re-sent.
 
@@ -731,9 +659,9 @@ Events from **all teams** are broadcast to **all clients**. This means you can o
 
 * * *
 
-## Trading Rules¶
+## Trading Rules
 
-### Order Matching¶
+### Order Matching
 
 The exchange uses a **price-time priority** matching engine:
 
@@ -744,17 +672,13 @@ The exchange uses a **price-time priority** matching engine:
   5. Partial fills are supported — an order can match multiple resting orders.
   6. Unmatched residual quantity rests on the book.
 
-
-
-### Order Expiry¶
+### Order Expiry
 
   * Orders automatically expire when the server time reaches or exceeds the order's `expiry` timestamp.
   * Expired orders are removed from the book and generate a `cancel` event.
   * Expiry checking occurs on every `add_order`, `cancel_order`, and periodic update cycle.
 
-
-
-### Position Limits¶
+### Position Limits
 
 Limit | Value | Description  
 ---|---|---  
@@ -764,7 +688,7 @@ Max long position | **2,000** | Maximum long position per instrument (units)
 Max short position | **−200** | Floor on net position per instrument (units)  
 Max negative cash | **−5,000,000** | Floor on cash balance per exchange (cents = −$50,000)  
   
-### Round Lifecycle¶
+### Round Lifecycle
 
 The server runs **one round per process**. In the competition each round corresponds to a single 10-minute segment — the exchange is restarted between segments and connections do not persist across the boundary.
 
@@ -777,34 +701,26 @@ The server runs **one round per process**. In the competition each round corresp
   7. Final settlement is performed and balances are saved.
   8. The exchange shuts down shortly after — your existing connection will close.
 
-
-
 For the next segment, a fresh server starts with reset positions and cash. You must reconnect.
 
 * * *
 
-## HTTP Endpoints¶
+## HTTP Endpoints
 
 These are standard HTTP endpoints (not WebSocket), available on the same port.
 
-### Health Check¶
-    
-    
+### Health Check
     GET /health
     
-
 No authentication required.
 
 **Response:**
-    
-    
     {
       "status": "healthy",
       "time": 52300,
       "round_length": 600000
     }
     
-
 Field | Type | Description  
 ---|---|---  
 `status` | string | Always `"healthy"`  
@@ -813,11 +729,9 @@ Field | Type | Description
   
 * * *
 
-## Client Examples¶
+## Client Examples
 
-### Python¶
-    
-    
+### Python
     import asyncio
     import json
     import time
@@ -871,10 +785,7 @@ Field | Type | Description
     
     asyncio.run(main())
     
-
-### JavaScript¶
-    
-    
+### JavaScript
     const WebSocket = require("ws");
     
     const ws = new WebSocket("ws://nyse.algotrade.hr:9001/trade");
@@ -937,10 +848,9 @@ Field | Type | Description
       }
     });
     
-
 * * *
 
-## Error Reference¶
+## Error Reference
 
 Error Message | Trigger  
 ---|---  
@@ -962,3 +872,4 @@ Error Message | Trigger
 * * *
 
 _Generated from source code analysis. Last updated: 2026-05-08._
+

@@ -1,0 +1,6 @@
+etf,n_basket_present,diff_mean_c,diff_std_c,diff_max_abs_c,abs_diff_>10c_%
+ETFA,6,9.39,62.78,124.92,89.4
+ETFB,6,3.71,49.3,120.17,66.0
+ETFA3,3,-19.4,90.81,202.5,85.1
+ETFB3,3,2.93,56.8,126.0,78.7
+ETFSH,2,-37.93,95.14,335.25,87.2

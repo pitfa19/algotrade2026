@@ -1,8 +1,8 @@
-# AlgoTrade 2026 — Participant Guide¶
+# AlgoTrade 2026 — Participant Guide
 
 * * *
 
-## 1) Overview¶
+## 1) Overview
 
 AlgoTrade 2026 is a simulated multi-exchange algorithmic trading competition. Your team will build and deploy a trading bot that trades 25 instruments (20 stocks + 5 ETFs) across 10 geographically distributed exchanges with realistic intercontinental latencies. One year of market volatility is compressed into a 30-minute session, creating a high density of trading opportunities within a short window.
 
@@ -12,9 +12,9 @@ The strategy space is broad and there is no single "correct" approach. Cross-ven
 
 * * *
 
-## 2) Rounds & Schedule¶
+## 2) Rounds & Schedule
 
-### Evaluation Rounds¶
+### Evaluation Rounds
 
 There are **4 evaluation rounds** , each lasting **30 minutes**. Each evaluation round is split into **3 segments of 10 minutes**.
 
@@ -25,21 +25,19 @@ At the start of each segment:
   * All positions, cash, and inventory **reset to initial state**.
   * Your team is assigned to a different geographic location (see Exchanges section).
 
-
-
 Your round score is the **sum of profits across all 3 segments**.
 
-### Testing Rounds¶
+### Testing Rounds
 
 Between evaluation rounds, there are **testing rounds** where you can iterate on your bot. Testing rounds are **not scored** — use them to experiment and improve.
 
-### Presentations¶
+### Presentations
 
 Teams will present their strategies and results. Details on presentation format and schedule will be announced separately.
 
 * * *
 
-## 3) The Task¶
+## 3) The Task
 
 Your team must:
 
@@ -47,15 +45,13 @@ Your team must:
   2. **Deploy it on your VM** — each team receives a virtual machine (4 vCPU, 6 GB RAM) where your bot runs.
   3. **Trade for profit** — across 3 segments per round, maximize your total PnL.
 
-
-
 You can use **any programming language**. The exchange API is WebSocket-based with JSON messages — if your language can open a WebSocket and parse JSON, it works.
 
 Your bot runs on your VM and connects to exchanges over the network. You are free to connect to as many or as few exchanges as you want, and to trade any subset of instruments.
 
 * * *
 
-## 4) Stocks¶
+## 4) Stocks
 
 There are **20 stocks** organized into groups:
 
@@ -75,9 +71,7 @@ Key properties:
   * **CARD** and **SIMP** are special instruments listed on all 10 exchanges, their logic we leave for you to figure out.
   * Stocks are **not listed on every exchange** — each stock is available on a specific subset of venues. The listing table is below.
 
-
-
-### Stock Listings by Exchange¶
+### Stock Listings by Exchange
 
 Ticker | NYSE | NASDAQ | LSE | Euronext | JPX | SSE | HKEX | NSE | TMX | ZSE  
 ---|---|---|---|---|---|---|---|---|---|---  
@@ -106,7 +100,7 @@ Note that **ZSE (Zagreb)** lists every stock — it is the only exchange with fu
 
 * * *
 
-## 5) ETFs¶
+## 5) ETFs
 
 There are **5 ETFs** — synthetic instruments whose value is derived from a basket of underlying stocks. ETFs trade exactly like stocks (same API, same order types), but their fair value tracks an equal-weighted average of their constituents.
 
@@ -118,7 +112,7 @@ ETF | Basket | Description
 **ETFB3** | KOTD, INA, DLKV | Sector B subset (3 stocks)  
 **ETFSH** | GOLD, XAG | Safe-Haven (moves inversely to market)  
   
-### ETF Fair Value¶
+### ETF Fair Value
 
 An ETF's fair value is the **simple equal-weighted average** of its constituent stock prices:
 
@@ -126,7 +120,7 @@ An ETF's fair value is the **simple equal-weighted average** of its constituent 
 
 For example, if ETFA3 tracks {NGUP, KTST, XFR} and their prices are $102, $98, and $100, then ETFA3's fair value is $100.
 
-### ETF Listings¶
+### ETF Listings
 
 ETF | NYSE | NASDAQ | LSE | Euronext | JPX | SSE | HKEX | NSE | TMX | ZSE  
 ---|---|---|---|---|---|---|---|---|---|---  
@@ -138,7 +132,7 @@ ETFSH |  |  |  | ✔ | ✔ |  |  |  |  | ✔
   
 * * *
 
-## 6) Market Making & Liquidity¶
+## 6) Market Making & Liquidity
 
 Every instrument on every exchange has a **Market Maker** — a built-in bot that continuously provides buy and sell quotes. The MM ensures you can always trade, even when no other teams are active.
 
@@ -149,17 +143,15 @@ Key MM characteristics:
   * Quotes a **tight spread** around its modeled fair value. The spread varies by asset.
   * Skews quotes based on accumulated inventory.
 
-
-
 There are also **Noise Traders** that send random market orders, providing a source of fills for resting limit orders.
 
 **Fees:** There are **zero trading fees** — no maker fees, no taker fees.
 
 * * *
 
-## 7) Exchanges & Latencies¶
+## 7) Exchanges & Latencies
 
-### The 10 Exchanges¶
+### The 10 Exchanges
 
 Each exchange listens on **port 9001** and is reachable on the venue network at both a hostname and an IP.
 
@@ -176,7 +168,7 @@ NSE | Mumbai | `nse.algotrade.hr` | `10.0.208.2`
 TMX | Toronto | `tmx.algotrade.hr` | `10.0.209.2`  
 ZSE | Zagreb | `zse.algotrade.hr` | `10.0.210.2`  
   
-### Location Rotation¶
+### Location Rotation
 
 Each round, your team rotates through **3 geographic locations** : **NYSE** (Americas), **ZSE** (Europe), and **HKEX** (Asia). One segment at each location, 10 minutes per segment. The order of rotation varies between groups.
 
@@ -184,7 +176,7 @@ Your "location" determines your network latency to each exchange. When you are c
 
 This rotation ensures no team has a permanent latency advantage — you must build a strategy that adapts to different latency profiles.
 
-### Inter-Exchange Latency Matrix (round-trip, ms)¶
+### Inter-Exchange Latency Matrix (round-trip, ms)
 
 | NYSE | NASDAQ | SSE | JPX | Euronext | LSE | HKEX | NSE | TMX | ZSE  
 ---|---|---|---|---|---|---|---|---|---|---  
@@ -203,7 +195,7 @@ These latencies affect both your order execution _and_ how fast price informatio
 
 * * *
 
-## 8) Demo Bot & History Bot¶
+## 8) Demo Bot & History Bot
 
 Reference bots are provided in the `bots/` directory as starting points:
 
@@ -211,21 +203,19 @@ Reference bots are provided in the `bots/` directory as starting points:
   * **`bots/cpp/demo_bot.cpp`** — same structure, ported to C++20.
   * **`bots/python/history_bot.py`** — connects to exchanges and records all market data to CSV for offline analysis.
 
-
-
 See **`bots/README.md`** for setup, dependencies, build instructions, environment variables, and the full callback list.
 
 * * *
 
-## 9) Trading UI¶
+## 9) Trading UI
 
 A web-based **trading dashboard** is provided for monitoring and manual interaction. Open it from any device on the venue network at:
 
-http://dashboard.algotrade.hr
+<http://dashboard.algotrade.hr>
 
 It is **not required** for competition — your bot operates independently — but it is useful for development and debugging.
 
-### Features¶
+### Features
 
   * **Order Book** — real-time display of bid/ask depth for each instrument
   * **Candlestick Charts** — price history with OHLCV candles
@@ -235,18 +225,14 @@ It is **not required** for competition — your bot operates independently — b
   * **Events Feed** — live stream of trades and cancellations
   * **Exchange Selector** — switch between exchanges
 
-
-
 * * *
 
-## 10) Network Access & Authentication¶
+## 10) Network Access & Authentication
 
 There are two ways to get on the venue network:
 
   * **Wired (recommended).** Each team's table has a switch with Ethernet ports — plug in and you are on. We strongly recommend the wired connection for stability.
   * **WiFi.** Each team is given a per-team WiFi login at the start of the event.
-
-
 
 The exchange network is not reachable from outside the venue.
 
@@ -256,46 +242,36 @@ Once connected, the following names resolve:
   * `dashboard.algotrade.hr` — trading UI
   * `<exchange>.algotrade.hr` — the 10 exchanges (full list in §7)
 
-
-
 Authentication is **automatic** — there is no token, secret, or login step on the WebSocket connection itself. Any connection you open while on the venue network is recognised as your team's:
-    
-    
     ws://<exchange_host>:9001/trade
     
-
 This applies equally to your VM and to your own laptops. All connections from your team are treated as a single account for inventory, rate limits, and order ownership.
 
 For SSH and file transfer, see **`Algotrade-Network-SSH-Guide.md`**.
 
 * * *
 
-## 11) API — Connecting to an Exchange¶
+## 11) API — Connecting to an Exchange
 
 Full API reference: see **`WEBSOCKET_API.md`** in the docs root.
 
-### Quick Start¶
+### Quick Start
 
 Connect via WebSocket:
-    
-    
     ws://nyse.algotrade.hr:9001/trade        # by hostname
     ws://10.0.201.2:9001/trade               # equivalent, by IP
     
-
 Each exchange runs on its own host on port **9001**. The full hostname/IP table is in §7 (and mirrored in `bots/README.md`).
 
 You may open **multiple concurrent connections to the same exchange** if it helps your architecture (for example, a separate connection dedicated to recording market data while your trading bot uses another). All connections from your team are treated as a single account for inventory, rate limits, and order ownership purposes.
 
-### Message Format¶
+### Message Format
 
 All messages are JSON. Every message has a `type` field. Include a `user_request_id` in your requests to correlate responses.
 
-### Key Operations¶
+### Key Operations
 
 **Place an order:**
-    
-    
     {
       "type": "add_order",
       "user_request_id": "order-1",
@@ -306,16 +282,11 @@ All messages are JSON. Every message has a `type` field. Include a `user_request
       "quantity": 10
     }
     
-
   * **Prices are in cents** (10050 = \\(100.50). The minimum tick size is **1 cent** (\\)0.01) — non-integer cent values are rejected.
   * **`side`** is `"bid"` (buy) or `"ask"` (sell).
   * **`expiry`** is a Unix epoch timestamp in **milliseconds**. The order is automatically cancelled at that time if still resting on the book.
 
-
-
 **Cancel an order:**
-    
-    
     {
       "type": "cancel_order",
       "user_request_id": "cancel-1",
@@ -323,17 +294,13 @@ All messages are JSON. Every message has a `type` field. Include a `user_request
       "instrument_id": "NYSE-CARD"
     }
     
-
 **Check your inventory:**
-    
-    
     {
       "type": "get_inventory",
       "user_request_id": "inv-1"
     }
     
-
-### Market Data¶
+### Market Data
 
 You automatically receive **market data broadcasts every 100 ms** after connecting. Each broadcast includes:
 
@@ -341,17 +308,13 @@ You automatically receive **market data broadcasts every 100 ms** after connecti
   * **Candles** — completed 1-second OHLCV candles
   * **Events** — recent trades and cancellations (from all participants)
 
-
-
 Instrument IDs follow the format `<EXCHANGE>-<TICKER>` (e.g., `NYSE-CARD`, `HKEX-GOLD`).
 
 The displayed order book **aggregates all resting orders from every participant** (your team, other teams, and the built-in market maker) — you cannot tell from the book alone whose orders sit at which level. Trade events are also **anonymous** : the broadcast carries price, quantity, and order IDs, but no team or bot identifier.
 
 The `end_of_round` message is sent at the end of every **segment** (every 10 minutes). After it fires the exchange shuts down — your connection will close. A fresh exchange (with reset positions and cash) starts for the next segment, and you must reconnect.
 
-### Minimal Python Example¶
-    
-    
+### Minimal Python Example
     import asyncio
     import json
     import time
@@ -388,10 +351,9 @@ The `end_of_round` message is sent at the end of every **segment** (every 10 min
     
     asyncio.run(main())
     
-
 * * *
 
-## 12) VM Access & SSH¶
+## 12) VM Access & SSH
 
 Each team receives a dedicated virtual machine:
 
@@ -401,36 +363,29 @@ Each team receives a dedicated virtual machine:
   * **User:** `root`
   * **Initial password:** `algotrade`
 
-
-
-### Connecting via SSH¶
-    
-    
+### Connecting via SSH
     ssh root@vm.algotrade.hr        # password: algotrade
     
-
 You have full root access to install packages and configure your environment.
 
-### Deploying Your Bot¶
+### Deploying Your Bot
 
   1. SSH into your VM (`ssh root@vm.algotrade.hr`).
   2. Transfer your bot code (`scp`, `rsync`, `git clone`, `VS Code Remote-SSH` or `Filezilla`).
   3. Install dependencies (`pip install`, `npm install`, etc.).
   4. Run your bot — preferably inside `tmux` or `screen` so it survives disconnects.
 
-
-
 For SSH/SCP/SFTP usage on every common OS, key setup, port forwarding, and troubleshooting, see **`Algotrade-Network-SSH-Guide.md`**.
 
 * * *
 
-## 13) Limits, Orders & Scoring¶
+## 13) Limits, Orders & Scoring
 
-### Short Selling¶
+### Short Selling
 
 Short selling is **allowed**. You can sell an instrument you don't own to profit from a price decrease. Your net position per instrument per exchange may not fall below **−200 shares**.
 
-### Position & Risk Limits¶
+### Position & Risk Limits
 
 Limit | Value  
 ---|---  
@@ -443,15 +398,13 @@ Message rate limit | 500 messages per team per exchange per second
   
 **Capital is isolated per exchange** — cash on NYSE cannot be used to cover positions on HKEX.
 
-### Order Types¶
+### Order Types
 
   * **Limit** — rests on the book at your specified price until filled, cancelled, or expired.
   * **Market** — executes immediately against the best available prices in the book; any unfilled remainder is cancelled.
   * **IOC (Immediate-Or-Cancel)** — like a limit order but the unfilled remainder is cancelled instead of resting.
 
-
-
-### Matching Engine¶
+### Matching Engine
 
 Orders are matched using **price-time priority (FIFO)** :
 
@@ -459,9 +412,7 @@ Orders are matched using **price-time priority (FIFO)** :
   2. At the same price, earliest order first.
   3. Trades execute at the resting (passive) order's price.
 
-
-
-### Scoring¶
+### Scoring
 
 Your score for a round is based on your **total profit** across the 3 segments, scaled logarithmically against the round's top performer:
 
@@ -472,24 +423,20 @@ Your score for a round is based on your **total profit** across the 3 segments, 
   * \\(\text{score}_{\max}\\) = the points awarded to the top performer
   * Zero or negative profit yields a score of 0
 
-
-
 The log scaling compresses the top of the distribution, so doubling the top team's profit does not double your score.
 
-### Settlement¶
+### Settlement
 
-## At the end of each segment, all open positions are marked to market and settled. The exact methodology is **not disclosed in advance** , it is some time- or volume-weighted measure over a window near the close.¶
+## At the end of each segment, all open positions are marked to market and settled. The exact methodology is **not disclosed in advance** , it is some time- or volume-weighted measure over a window near the close.
 
-## 14) Q&A / Discord¶
+## 14) Q&A / Discord
 
-### Getting Help¶
+### Getting Help
 
   * **Discord** — join the competition Discord server for announcements, Q&A, and real-time support.
   * **On-site support** — organizers will be available during the event to answer technical questions.
 
-
-
-### Common Questions¶
+### Common Questions
 
 **Q: Can I connect to multiple exchanges at once?** A: Yes — that is the expected setup. You can hold connections to all 10 exchanges simultaneously, and you can also open more than one connection to the same exchange (for example, a dedicated connection for recording market data alongside your trading bot). All connections from your team are treated as a single account.
 
@@ -504,3 +451,4 @@ The log scaling compresses the top of the distribution, so doubling the top team
 * * *
 
 _Good luck, and may the best algorithm win._
+

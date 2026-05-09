@@ -1,4 +1,4 @@
-# AlgoTrade 2026 — Reference Bots¶
+# AlgoTrade 2026 — Reference Bots
 
 Starter bots to help you get up and running quickly.
 
@@ -21,21 +21,18 @@ The demo bots use the IPs by default. Either form works.
 
 By default each bot connects to all 10 exchanges. Set `EXCHANGES` to a comma-separated list of names to narrow the set.
 
-## Python Demo Bot¶
+## Python Demo Bot
 
 **File:** `python/demo_bot.py`
 
 A trading bot framework with a clean strategy interface. The bot handles all WebSocket connections, message parsing, and market state management. You implement your strategy by subclassing `Strategy`.
-    
-    
     pip install websockets
     python python/demo_bot.py
     
     # Or restrict to a few exchanges:
     EXCHANGES="NYSE,NASDAQ,LSE" python python/demo_bot.py
     
-
-### Structure¶
+### Structure
 
 Class | Purpose  
 ---|---  
@@ -45,9 +42,7 @@ Class | Purpose
 `ExchangeConnection` | One WebSocket connection with order/cancel/inventory helpers  
 `Bot` | Orchestrator — connects to exchanges, dispatches events to your strategy  
   
-### Implement Your Strategy¶
-    
-    
+### Implement Your Strategy
     class MyStrategy(Strategy):
         async def on_market_data(self, bot: Bot, exchange: str, state: MarketState) -> None:
             book = state.get_book(exchange, f"{exchange}-CARD")
@@ -61,33 +56,26 @@ Class | Purpose
     bot = Bot(strategy)
     asyncio.run(bot.run())
     
-
 * * *
 
-## C++ Demo Bot¶
+## C++ Demo Bot
 
 **File:** `cpp/demo_bot.cpp`
 
 Same architecture as the Python version, ported to C++20.
 
-### Dependencies¶
+### Dependencies
 
-  * Boost.Beast — WebSocket client (part of Boost)
-  * nlohmann/json — JSON parsing
+  * [Boost.Beast](<https://www.boost.org/doc/libs/release/libs/beast/>) — WebSocket client (part of Boost)
+  * [nlohmann/json](<https://github.com/nlohmann/json>) — JSON parsing
 
-
-    
-    
     # Ubuntu/Debian
     sudo apt install libboost-all-dev nlohmann-json3-dev
     
     # Arch Linux
     sudo pacman -S boost nlohmann-json
     
-
-### Build & Run¶
-    
-    
+### Build & Run
     # Option A: Direct compile
     g++ -std=c++20 -O2 -o demo_bot cpp/demo_bot.cpp -lpthread
     
@@ -101,10 +89,7 @@ Same architecture as the Python version, ported to C++20.
     # Or restrict to a few exchanges:
     EXCHANGES="NYSE,NASDAQ,LSE" ./demo_bot
     
-
-### Implement Your Strategy¶
-    
-    
+### Implement Your Strategy
     class MyStrategy : public Strategy {
     public:
         void on_market_data(Bot& bot, const std::string& exchange,
@@ -119,24 +104,20 @@ Same architecture as the Python version, ported to C++20.
         }
     };
     
-
 * * *
 
-## Python History Bot¶
+## Python History Bot
 
 **File:** `python/history_bot.py`
 
 Connects to exchanges and records all market data to CSV files for offline analysis.
-    
-    
     pip install websockets
     python python/history_bot.py
     
     # Or restrict to a few exchanges and choose an output dir:
     EXCHANGES="NYSE,NASDAQ" OUTPUT_DIR="./market_data" python python/history_bot.py
     
-
-### Output Files (per exchange)¶
+### Output Files (per exchange)
 
 File | Contents | Columns  
 ---|---|---  
@@ -145,9 +126,7 @@ File | Contents | Columns
 `<EXCH>_candles.csv` | Completed OHLCV candles | index, instrument, open, high, low, close, volume  
 `<EXCH>_events.csv` | Cancel events | time, instrument, order_id, expired  
   
-### Example: Loading Data for Analysis¶
-    
-    
+### Example: Loading Data for Analysis
     import pandas as pd
     
     # Load order book history
@@ -162,10 +141,9 @@ File | Contents | Columns
     trades = pd.read_csv("market_data/NYSE_trades.csv")
     print(f"Total trades: {len(trades)}")
     
-
 * * *
 
-## Environment Variables¶
+## Environment Variables
 
 All bots share these environment variables:
 
@@ -175,3 +153,4 @@ Variable | Description | Default
 `OUTPUT_DIR` | History bot output directory | `./market_data`  
   
 > The production network authenticates by team IP, so no `TEAM_SECRET` is required. Per-exchange hosts and the port (9001) are hardcoded — edit the `EXCHANGE_HOSTS` constant at the top of each bot if your network differs.
+
