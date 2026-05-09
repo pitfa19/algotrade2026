@@ -285,10 +285,50 @@ class ForceCloseTests(unittest.TestCase):
         strategy = RailEdgeStrategy(config)
         orders = strategy.plan_orders(state, depth=None,
                                       now_ms=config.force_close_after_ms + 10)
-        force = [o for o in orders if o["role"] == "force_close"]
+        force = [o for o in orders if o.get("role") == "force_close"]
         self.assertEqual(len(force), 1)
         self.assertEqual((force[0]["side"], force[0]["order_type"], force[0]["quantity"]),
                          ("bid", "market", 150))
+
+    def test_force_close_cancels_conflicting_rail_bid_when_long(self):
+        # When stuck long, the market sell would self-trade against our
+        # own resting rail BID — so the force-close must cancel it first.
+        config = default_rail_configs()["NASDAQ"]
+        state = synced_state(exchange="NASDAQ")
+        state.positions["NASDAQ-CARD"] = 200
+        state.last_flat_ms["NASDAQ-CARD"] = 0
+        state.track_order(
+            local_id="rail-b", order_id=77,
+            instrument="NASDAQ-CARD", side="bid",
+            price=config.low_bid_price, quantity=200, role="rail",
+        )
+        # ALSO a rail ask — should NOT be cancelled (it's our exit).
+        state.track_order(
+            local_id="rail-a", order_id=88,
+            instrument="NASDAQ-CARD", side="ask",
+            price=config.high_ask_price, quantity=100, role="rail",
+        )
+        strategy = RailEdgeStrategy(config)
+        orders = strategy.plan_orders(state, depth=None,
+                                      now_ms=config.force_close_after_ms + 1)
+        cancels = [o for o in orders if o.get("type") == "cancel_order"]
+        self.assertEqual({c["order_id"] for c in cancels}, {77})
+
+    def test_force_close_cancels_conflicting_rail_ask_when_short(self):
+        config = default_rail_configs()["NASDAQ"]
+        state = synced_state(exchange="NASDAQ")
+        state.positions["NASDAQ-CARD"] = -100
+        state.last_flat_ms["NASDAQ-CARD"] = 0
+        state.track_order(
+            local_id="rail-a", order_id=99,
+            instrument="NASDAQ-CARD", side="ask",
+            price=config.high_ask_price, quantity=100, role="rail",
+        )
+        strategy = RailEdgeStrategy(config)
+        orders = strategy.plan_orders(state, depth=None,
+                                      now_ms=config.force_close_after_ms + 1)
+        cancels = [o for o in orders if o.get("type") == "cancel_order"]
+        self.assertEqual({c["order_id"] for c in cancels}, {99})
 
 
 class ProtocolTests(unittest.TestCase):

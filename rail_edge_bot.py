@@ -341,23 +341,26 @@ class RailEdgeStrategy:
         instrument = self.config.instrument
         orders: list[dict[str, Any]] = []
 
-        # 1. Force-flatten if inventory has been held past the timeout.
-        force_close = self._plan_force_close(state, now_ms)
-        if force_close is not None:
-            orders.append(force_close)
+        # 1. Force-flatten path: cancel conflicting rail + market-out.
+        orders.extend(self._plan_force_close(state, now_ms))
 
         # 2. Polite IOC close at the configured "fair" thresholds.
         close_order = self._plan_close_order(state, depth)
         if close_order is not None:
             orders.append(close_order)
 
-        # Reservations made by close + force_close, in the units each
-        # downstream sizer needs:
-        #   ask sizer wants SHARES (we'd be reducing free_qty)
-        #   bid sizer wants VALUE  (we'd be reducing free_cash)
+        # Reservations made by close + force_close in the units each rail
+        # sizer needs. Cancel-actions don't reserve anything (they free a
+        # resting order), so we skip them. We also exclude `force_close`
+        # market orders from the sizers because their qty is the position
+        # we already account for via state.free_*.
         extra_ask_qty   = 0
         extra_bid_value = 0
         for o in orders:
+            if o.get("type") == "cancel_order":
+                continue
+            if o.get("role") == "force_close":
+                continue
             if o["side"] == "ask":
                 extra_ask_qty   += int(o["quantity"])
             else:
@@ -388,41 +391,56 @@ class RailEdgeStrategy:
 
     def _plan_force_close(
         self, state: ExchangeState, now_ms: int
-    ) -> dict[str, Any] | None:
-        """If we have been holding inventory past `force_close_after_ms`,
-        flatten with a market order. Captures whatever liquidity is there,
-        guarantees we recycle capital."""
+    ) -> list[dict[str, Any]]:
+        """If inventory has been held past `force_close_after_ms`, clear
+        what's blocking the unwind and market-flatten in one step.
+
+        - When long: cancel any rail BID we own (otherwise the market sell
+          could self-trade against our own bid), then send a market sell.
+        - When short: cancel any rail ASK we own, then send a market buy.
+
+        After this, the rails re-arm immediately on the next tick — no
+        cooldown — so we keep firing 'lots of bets' as the user wants.
+        """
         instrument = self.config.instrument
         pos = state.position(instrument)
         if pos == 0:
             state.last_flat_ms[instrument] = int(now_ms)
-            return None
+            return []
         last_flat = state.last_flat_ms.get(instrument)
         if last_flat is None:
             # first non-zero observation — anchor the timer here so the polite
             # IOC close path gets a chance before we fall back to market.
             state.last_flat_ms[instrument] = int(now_ms)
-            return None
+            return []
         if int(now_ms) - last_flat < int(self.config.force_close_after_ms):
-            return None
-        # past timeout — flatten, market style.
+            return []
+
+        actions: list[dict[str, Any]] = []
+        # cancel only the rail order on the side that conflicts with the
+        # flatten direction. We keep the OTHER rail alive so the next tick
+        # can immediately catch the next spike.
+        conflict_side = "bid" if pos > 0 else "ask"
+        for o in list(state.live_orders.values()):
+            if o.instrument == instrument and o.side == conflict_side and o.role == "rail":
+                actions.append({
+                    "type": "cancel_order",
+                    "order_id": int(o.order_id),
+                    "instrument_id": instrument,
+                    "role": "force_close_cancel",
+                })
+
         if pos > 0:
-            return self._order(
-                instrument=instrument,
-                side="ask",
-                price=0,                # ignored for market
-                quantity=pos,
-                order_type="market",
-                role="force_close",
-            )
-        return self._order(
-            instrument=instrument,
-            side="bid",
-            price=0,
-            quantity=-pos,
-            order_type="market",
-            role="force_close",
-        )
+            actions.append(self._order(
+                instrument=instrument, side="ask", price=0,
+                quantity=pos, order_type="market", role="force_close",
+            ))
+        else:
+            actions.append(self._order(
+                instrument=instrument, side="bid", price=0,
+                quantity=-pos, order_type="market", role="force_close",
+            ))
+        return actions
 
     def _plan_close_order(
         self, state: ExchangeState, depth: dict[str, dict[str, int]] | None
@@ -695,17 +713,30 @@ class RailEdgeBot:
                         depths = message.get("orderbook_depths", {})
                         depth = depths.get(config.instrument)
                         planned = strategy.plan_orders(state, depth, now_ms)
-                        for order in planned:
+                        for action in planned:
                             seq += 1
-                            request_id = f"{exchange}-{seq}-{order['role']}"
+                            request_id = f"{exchange}-{seq}-{action['role']}"
+                            if action.get("type") == "cancel_order":
+                                # drop the live order locally now so the
+                                # next plan can't double-cancel.
+                                state.drop_order(int(action["order_id"]))
+                                await self._send_json(
+                                    ws, limiter,
+                                    build_cancel_order(
+                                        request_id=request_id,
+                                        instrument_id=action["instrument_id"],
+                                        order_id=int(action["order_id"]),
+                                    ),
+                                )
+                                continue
                             pending_order = PendingOrder(
                                 local_id=request_id,
-                                instrument=order["instrument_id"],
-                                side=order["side"],
-                                price=order["price"],
-                                quantity=order["quantity"],
-                                order_type=order["order_type"],
-                                role=order["role"],
+                                instrument=action["instrument_id"],
+                                side=action["side"],
+                                price=action["price"],
+                                quantity=action["quantity"],
+                                order_type=action["order_type"],
+                                role=action["role"],
                             )
                             pending[request_id] = pending_order
                             state.track_inflight(pending_order)
@@ -714,11 +745,11 @@ class RailEdgeBot:
                                 limiter,
                                 build_add_order(
                                     request_id=request_id,
-                                    instrument_id=order["instrument_id"],
-                                    side=order["side"],
-                                    price=order["price"],
-                                    quantity=order["quantity"],
-                                    order_type=order["order_type"],
+                                    instrument_id=action["instrument_id"],
+                                    side=action["side"],
+                                    price=action["price"],
+                                    quantity=action["quantity"],
+                                    order_type=action["order_type"],
                                     ttl_ms=self.order_ttl_ms,
                                 ),
                             )
