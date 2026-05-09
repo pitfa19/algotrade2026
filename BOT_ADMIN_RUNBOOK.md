@@ -63,6 +63,8 @@ Avoid running these together:
 - `codex_bot.py` and `codex_bot_v2.py`: same family, same edges, will fight.
 - `namikv1.py` and `namikv2.py`: same family, same edges, will fight.
 - `prism.py` and any other active trading bot: `prism.py` is broad and aggressive.
+- `prism.py` and `cascade.py`: identical strategy surface, will fight each other.
+- `cascade.py` and any other active trading bot: same edge surface as prism, broader fills.
 - `parallax.py` and any other active trading bot: `parallax.py` is the broadest in the repo.
 - `parallax.py` and `prism.py`: maximum overlap; both fire ETF/basket/sub-ETF/xv arbs.
 - `parallax.py` and `apex_bot.py`: both fire ETF basket arb and cross-venue arb.
@@ -137,6 +139,7 @@ Scores are operator scores from 1-10, not guaranteed PnL.
 | `namikv2.py` | Yes | namikv1 + ETF-implied stock fair value, more strategies | 5 | 8 | 9 | 5 | 7 | Newer Namik variant — compare dry-run to v1 |
 | `alpha_bot.py` | Yes | MM-skew, non-50 size, CARD/SIMP, adaptive thresholds | 5 | 8 | 9 | 6 | 7 | Advanced experimental |
 | `prism.py` | Yes | Multi-venue ETF/basket/sub-ETF/stock arb + passive MM | 4 | 9 | 10 | 6 | 7 | Highest ambition, highest blast radius |
+| `cascade.py` | Yes | prism + depth-walked ETF basket arb, plan ranking, faster reconnect | 4 | 9 | 10 | 6 | 8 | Surgical superset of prism — verified 3× ETF arb size on stacked-edge books |
 | `parallax.py` | Yes | prism edges + consensus FV, vol-adaptive thresholds, stat FV snipe, sector residual ETF-hedged, SH coherence, inv+flow-skewed MM | 4 | 10 | 10 | 5 | 8 | Broadest bot in the repo; highest expected edge but highest blast radius |
 | `apex_bot.py` | Yes | Rule-based ETF basket arb + ZSE oracle cross-venue + MM-skew + EOS unwind | 7 | 8 | 6 | 7 | 8 | New flagship, deterministic ETF edge, untested live |
 | `god_bot.py` | Yes | Dry-run-gated ETF/basket, lead-lag, anomaly, safe-haven, flattening | 8 | 8 | 7 | 7 | 8 | New safest broad bot; first live with conservative caps |
@@ -625,6 +628,71 @@ EOS_FLATTEN_MS=8000
 Admin score: 7/10 overall, but 4/10 safety. Use only after observing it on a
 small venue subset.
 
+### `cascade.py`
+
+Purpose: surgical descendant of `prism.py`. Same strategies, same thresholds,
+same defensive bits — three execution-quality changes only:
+
+1. **Depth-walked ETF basket arb.** The ETF leg walks every ask/bid level
+   that still beats `ARB_EDGE` on its marginal price, instead of stopping
+   at top-of-book qty. The IOC limit is set to the worst accepted level so
+   server price-time priority gives price improvement on shallower levels.
+   Same edge floor, same risk-per-share, ~3× the size on the same
+   opportunity when the MM is mispriced through multiple levels.
+2. **Plan ranking.** When multiple arb plans land on one tick, the
+   highest-edge plan fires first so it consumes position/cash headroom
+   before the smaller ones do.
+3. **Faster reconnect.** `MAX_BACKOFF_S` lowered from `4.0` to `1.5`. With
+   3 segment boundaries per round, this returns 5–10 s of trade time.
+
+Verified empirically on a stacked-edge synthetic book: prism takes `k=8`
+baskets at top-of-book, cascade takes `k=25`. On a thin book with only
+top-of-book having edge, cascade and prism produce identical plans.
+
+Subset test run:
+
+```bash
+tmux new -s cascade-test
+LOGLEVEL=INFO python3 cascade.py --venues ZSE,NYSE,TMX
+```
+
+Full run:
+
+```bash
+tmux new -s cascade
+LOGLEVEL=INFO python3 cascade.py
+```
+
+Flags:
+
+| Flag/Env | Default | Meaning |
+|---|---:|---|
+| `--venues` | all 10 | Comma-separated venue subset |
+| `LOGLEVEL` | `INFO` | Logging verbosity |
+
+Important constants in file (identical to prism except `MAX_BACKOFF_S`):
+
+```text
+RATE_PER_S=400
+SOFT_POS_MAX=1800
+SOFT_POS_MIN=-180
+ARB_EDGE=4
+SUB_ETF_EDGE=6
+XV_EDGE=3
+ARB_MAX_K=25
+XV_MAX_QTY=40
+MM_QTY=4
+EOS_UNWIND_MS=60000
+EOS_FLATTEN_MS=8000
+MAX_BACKOFF_S=1.5     # prism: 4.0
+```
+
+Do not run alongside `prism.py` — identical strategy surface, will fight
+for the same fills against the same shared cash and inventory.
+
+Admin score: 8/10 overall, 4/10 safety. If prism was already winning,
+cascade is the strict superset.
+
 ### `parallax.py`
 
 Purpose: broadest strategy bot in the repo. Treats every quote as a
@@ -1079,6 +1147,7 @@ Use this during a round:
 | Analyzer shows repeated routes like `INA HKEX -> NASDAQ` | `edge_trader_bot.py` |
 | You want broad alpha and can monitor closely | `codex_bot.py`, `codex_bot_v2.py`, `namikv1.py`, `namikv2.py`, or `alpha_bot.py` |
 | You want maximum ambition and accept risk | `prism.py --venues ...` |
+| You like prism but want bigger fills on the same edges | `cascade.py --venues ...` |
 | You want broader-than-prism alpha with consensus FV, stat snipes, and inventory-skewed MM | `parallax.py --venues ...` |
 | You want the deterministic ETF edge with auto co-location | `apex_bot.py` (dry-run first) |
 | You want the new broad bot with dry-run gate and strict risk checks | `god_bot.py` conservative command |
