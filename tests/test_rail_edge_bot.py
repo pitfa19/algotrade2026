@@ -269,13 +269,15 @@ class ForceCloseTests(unittest.TestCase):
                                       now_ms=1_000 + config.force_close_after_ms - 1)
         self.assertFalse(any(o["role"] == "force_close" for o in orders))
 
-        # past timeout: market sell fires
+        # past timeout: aggressive IOC fires, priced just above our rail
+        # bid so the unwind cannot self-trade against it.
         orders = strategy.plan_orders(state, depth=None,
                                       now_ms=1_000 + config.force_close_after_ms + 1)
-        force = [o for o in orders if o["role"] == "force_close"]
+        force = [o for o in orders if o.get("role") == "force_close"]
         self.assertEqual(len(force), 1)
         self.assertEqual((force[0]["side"], force[0]["order_type"], force[0]["quantity"]),
-                         ("ask", "market", 200))
+                         ("ask", "ioc", 200))
+        self.assertEqual(force[0]["price"], config.low_bid_price + 1)
 
     def test_short_inventory_force_closes_with_market_after_timeout(self):
         config = default_rail_configs()["NASDAQ"]
@@ -288,11 +290,13 @@ class ForceCloseTests(unittest.TestCase):
         force = [o for o in orders if o.get("role") == "force_close"]
         self.assertEqual(len(force), 1)
         self.assertEqual((force[0]["side"], force[0]["order_type"], force[0]["quantity"]),
-                         ("bid", "market", 150))
+                         ("bid", "ioc", 150))
+        self.assertEqual(force[0]["price"], config.high_ask_price - 1)
 
-    def test_force_close_cancels_conflicting_rail_bid_when_long(self):
-        # When stuck long, the market sell would self-trade against our
-        # own resting rail BID — so the force-close must cancel it first.
+    def test_force_close_ioc_price_cannot_self_trade_with_rail_bid(self):
+        # Rail bid is at low_bid_price (e.g. $50). The force-close IOC
+        # ASK is set at low_bid_price + 1 ($50.01) so it never crosses
+        # our own bid; only MM/other-team bids at higher prices match.
         config = default_rail_configs()["NASDAQ"]
         state = synced_state(exchange="NASDAQ")
         state.positions["NASDAQ-CARD"] = 200
@@ -302,19 +306,17 @@ class ForceCloseTests(unittest.TestCase):
             instrument="NASDAQ-CARD", side="bid",
             price=config.low_bid_price, quantity=200, role="rail",
         )
-        # ALSO a rail ask — should NOT be cancelled (it's our exit).
-        state.track_order(
-            local_id="rail-a", order_id=88,
-            instrument="NASDAQ-CARD", side="ask",
-            price=config.high_ask_price, quantity=100, role="rail",
-        )
         strategy = RailEdgeStrategy(config)
         orders = strategy.plan_orders(state, depth=None,
                                       now_ms=config.force_close_after_ms + 1)
-        cancels = [o for o in orders if o.get("type") == "cancel_order"]
-        self.assertEqual({c["order_id"] for c in cancels}, {77})
+        force = [o for o in orders if o.get("role") == "force_close"]
+        self.assertEqual(len(force), 1)
+        self.assertEqual(force[0]["side"], "ask")
+        # ask price must be STRICTLY above our rail bid so the order
+        # cannot match against ourselves.
+        self.assertGreater(force[0]["price"], config.low_bid_price)
 
-    def test_force_close_cancels_conflicting_rail_ask_when_short(self):
+    def test_force_close_ioc_price_cannot_self_trade_with_rail_ask(self):
         config = default_rail_configs()["NASDAQ"]
         state = synced_state(exchange="NASDAQ")
         state.positions["NASDAQ-CARD"] = -100
@@ -327,8 +329,10 @@ class ForceCloseTests(unittest.TestCase):
         strategy = RailEdgeStrategy(config)
         orders = strategy.plan_orders(state, depth=None,
                                       now_ms=config.force_close_after_ms + 1)
-        cancels = [o for o in orders if o.get("type") == "cancel_order"]
-        self.assertEqual({c["order_id"] for c in cancels}, {99})
+        force = [o for o in orders if o.get("role") == "force_close"]
+        self.assertEqual(len(force), 1)
+        self.assertEqual(force[0]["side"], "bid")
+        self.assertLess(force[0]["price"], config.high_ask_price)
 
 
 class ProtocolTests(unittest.TestCase):

@@ -392,15 +392,22 @@ class RailEdgeStrategy:
     def _plan_force_close(
         self, state: ExchangeState, now_ms: int
     ) -> list[dict[str, Any]]:
-        """If inventory has been held past `force_close_after_ms`, clear
-        what's blocking the unwind and market-flatten in one step.
+        """If inventory has been held past `force_close_after_ms`, send an
+        aggressive IOC just outside our own rail so we flatten without
+        self-trading and without depending on the book having any
+        particular liquidity.
 
-        - When long: cancel any rail BID we own (otherwise the market sell
-          could self-trade against our own bid), then send a market sell.
-        - When short: cancel any rail ASK we own, then send a market buy.
+        - When long: IOC ask at low_bid_price + 1, qty = pos.
+            ‣ matches every bid ≥ that price (MM, other teams), so it
+              clears whatever real liquidity exists at fair value.
+            ‣ does NOT match our own rail bid at low_bid_price (strictly
+              less), so we cannot self-trade.
+            ‣ if NO bid exists at that price either, the IOC cancels;
+              the timer fires again next tick and we retry.
+        - When short: IOC bid at high_ask_price − 1, qty = −pos. (mirror)
 
-        After this, the rails re-arm immediately on the next tick — no
-        cooldown — so we keep firing 'lots of bets' as the user wants.
+        Rails on both sides stay live, so the very next spike still gets
+        caught — no cooldown.
         """
         instrument = self.config.instrument
         pos = state.position(instrument)
@@ -409,38 +416,33 @@ class RailEdgeStrategy:
             return []
         last_flat = state.last_flat_ms.get(instrument)
         if last_flat is None:
-            # first non-zero observation — anchor the timer here so the polite
-            # IOC close path gets a chance before we fall back to market.
+            # first non-zero observation — anchor the timer here so the
+            # polite IOC close path gets a chance first.
             state.last_flat_ms[instrument] = int(now_ms)
             return []
         if int(now_ms) - last_flat < int(self.config.force_close_after_ms):
             return []
 
-        actions: list[dict[str, Any]] = []
-        # cancel only the rail order on the side that conflicts with the
-        # flatten direction. We keep the OTHER rail alive so the next tick
-        # can immediately catch the next spike.
-        conflict_side = "bid" if pos > 0 else "ask"
-        for o in list(state.live_orders.values()):
-            if o.instrument == instrument and o.side == conflict_side and o.role == "rail":
-                actions.append({
-                    "type": "cancel_order",
-                    "order_id": int(o.order_id),
-                    "instrument_id": instrument,
-                    "role": "force_close_cancel",
-                })
-
         if pos > 0:
-            actions.append(self._order(
-                instrument=instrument, side="ask", price=0,
-                quantity=pos, order_type="market", role="force_close",
-            ))
-        else:
-            actions.append(self._order(
-                instrument=instrument, side="bid", price=0,
-                quantity=-pos, order_type="market", role="force_close",
-            ))
-        return actions
+            free = state.free_qty(instrument)
+            qty = max(0, min(free, pos))
+            if qty <= 0:
+                return []
+            return [self._order(
+                instrument=instrument, side="ask",
+                price=int(self.config.low_bid_price) + 1,
+                quantity=qty, order_type="ioc", role="force_close",
+            )]
+        # short side
+        cash_qty = state.free_cash() // max(1, int(self.config.high_ask_price) - 1)
+        qty = max(0, min(-pos, cash_qty))
+        if qty <= 0:
+            return []
+        return [self._order(
+            instrument=instrument, side="bid",
+            price=int(self.config.high_ask_price) - 1,
+            quantity=qty, order_type="ioc", role="force_close",
+        )]
 
     def _plan_close_order(
         self, state: ExchangeState, depth: dict[str, dict[str, int]] | None
