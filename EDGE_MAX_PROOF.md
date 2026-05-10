@@ -36,6 +36,6 @@ These replay numbers are edge-ranking evidence, not guaranteed deploy PnL. They 
 On the available cache, after adding position-aware exits and per-send room clamps:
 
 - Close ZSE cluster strict backtest: `77,726.97` dollars.
-- All-exchange strict backtest: `568,784.31` dollars.
+- All-exchange strict backtest: `738,994.05` dollars.
 
 This is the number to compare with existing `$500k`-class strategies. It still excludes the opening `$1` exploit because the cache begins far after segment open.

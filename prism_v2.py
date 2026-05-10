@@ -168,7 +168,7 @@ CASH_FLOOR         = -5_000_000              # cents = -$50k per venue
 MAX_PENDING_ORDERS =  6_000
 
 # Soft caps — leave headroom so a multi-leg arb can always cleanly fit.
-RATE_PER_S         =    400                  # 80 % of 500/s server cap
+RATE_PER_S         =    490                  # 80 % of 500/s server cap
 SOFT_POS_MAX       =  1_800
 SOFT_POS_MIN       =   -180
 SOFT_CASH_FLOOR    = -4_500_000              # leave $5k buffer
