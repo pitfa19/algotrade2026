@@ -314,8 +314,11 @@ class ExchangeState:
     arb_inventory: dict[str, int] = field(default_factory=dict)
     cash: int = 10_000_000
     cash_reserved: int = 0
+    local_cash_reserved: int = 0
+    local_position_reserved: dict[str, int] = field(default_factory=dict)
     active_order_keys: set[tuple[str, Side, int]] = field(default_factory=set)
     request_keys: dict[str, tuple[str, Side, int]] = field(default_factory=dict)
+    request_orders: dict[str, PlannedOrder] = field(default_factory=dict)
     request_tags: dict[str, str] = field(default_factory=dict)
     last_seed_s: float = 0.0
     last_inventory_s: float = 0.0
@@ -431,11 +434,13 @@ class ExchangeClient:
         if isinstance(cash, list) and len(cash) >= 2:
             self.state.cash_reserved = int(cash[0])
             self.state.cash = int(cash[1])
+            self.state.local_cash_reserved = 0
         for instrument_id, pair in data.items():
             if instrument_id == "$" or not isinstance(pair, list) or len(pair) < 2:
                 continue
             self.state.position_reserved[instrument_id] = int(pair[0])
             self.state.positions[instrument_id] = int(pair[1])
+            self.state.local_position_reserved[instrument_id] = 0
 
     def on_pending(self, msg: dict[str, Any]) -> None:
         active: set[tuple[str, Side, int]] = set()
@@ -453,16 +458,23 @@ class ExchangeClient:
         req_id = msg.get("user_request_id", "")
         tag = self.state.request_tags.pop(req_id, "")
         key = self.state.request_keys.pop(req_id, None)
+        order = self.state.request_orders.pop(req_id, None)
         if msg.get("success") and key is not None and tag == "landmine":
             self.state.active_order_keys.add(key)
-        if msg.get("success") and tag == "arb":
-            data = msg.get("data") or {}
+        data = msg.get("data") or {}
+        if msg.get("success"):
             change = data.get("immediate_inventory_change")
             if change and key is not None:
                 instrument_id = key[0]
-                self.state.arb_inventory[instrument_id] = self.state.arb_inventory.get(instrument_id, 0) + int(change)
+                self.state.positions[instrument_id] = self.state.positions.get(instrument_id, 0) + int(change)
+                if tag == "arb":
+                    self.state.arb_inventory[instrument_id] = self.state.arb_inventory.get(instrument_id, 0) + int(change)
+            balance_change = data.get("immediate_balance_change")
+            if balance_change:
+                self.state.cash += int(balance_change)
         if not msg.get("success"):
-            data = msg.get("data") or {}
+            if order is not None:
+                self.release_local_reservation(order)
             message = data.get("message") or msg.get("message")
             if message:
                 print(f"[{self.exchange}] add rejected: {message}", flush=True)
@@ -471,14 +483,33 @@ class ExchangeClient:
         return can_submit_order(
             order,
             cash_total=self.state.cash,
-            cash_reserved=self.state.cash_reserved,
+            cash_reserved=self.state.cash_reserved + self.state.local_cash_reserved,
             position_total=self.state.positions.get(order.instrument_id, 0),
-            position_reserved=self.state.position_reserved.get(order.instrument_id, 0),
+            position_reserved=self.state.position_reserved.get(order.instrument_id, 0)
+            + self.state.local_position_reserved.get(order.instrument_id, 0),
             allow_short=self.cfg.allow_short,
             min_cash=self.cfg.min_cash,
             cash_buffer=self.cfg.cash_buffer,
             short_floor=self.cfg.short_floor,
         )
+
+    def hold_local_reservation(self, order: PlannedOrder) -> None:
+        if order.order_type != "limit":
+            return
+        if order.side == "bid":
+            self.state.local_cash_reserved += order.price * order.quantity
+        else:
+            current = self.state.local_position_reserved.get(order.instrument_id, 0)
+            self.state.local_position_reserved[order.instrument_id] = current + order.quantity
+
+    def release_local_reservation(self, order: PlannedOrder) -> None:
+        if order.order_type != "limit":
+            return
+        if order.side == "bid":
+            self.state.local_cash_reserved = max(0, self.state.local_cash_reserved - order.price * order.quantity)
+        else:
+            current = self.state.local_position_reserved.get(order.instrument_id, 0)
+            self.state.local_position_reserved[order.instrument_id] = max(0, current - order.quantity)
 
     async def add_order(self, order: PlannedOrder, expiry_ms: int | None = None, tag: str = "") -> None:
         if not self.can_submit(order):
@@ -487,6 +518,8 @@ class ExchangeClient:
         key = (order.instrument_id, order.side, order.price)
         self.state.request_tags[req_id] = tag
         self.state.request_keys[req_id] = key
+        self.state.request_orders[req_id] = order
+        self.hold_local_reservation(order)
         payload: dict[str, Any] = {
             "type": "add_order",
             "user_request_id": req_id,

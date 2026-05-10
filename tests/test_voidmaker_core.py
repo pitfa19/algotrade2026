@@ -3,19 +3,29 @@ import unittest
 from voidmaker import (
     ArbOpportunity,
     BookTop,
+    ExchangeClient,
     LandmineConfig,
     LandmineFill,
+    PlannedOrder,
     build_landmine_orders,
     can_submit_order,
     estimate_landmine_profit_cents,
     find_cross_venue_arbs,
     select_close_exchanges,
     unprotected_position,
-    PlannedOrder,
 )
 
 
-class VoidmakerCoreTest(unittest.TestCase):
+class RecordingExchangeClient(ExchangeClient):
+    def __init__(self):
+        super().__init__("LSE", LandmineConfig())
+        self.sent = []
+
+    async def send(self, payload):
+        self.sent.append(payload)
+
+
+class VoidmakerCoreTest(unittest.IsolatedAsyncioTestCase):
     def test_select_close_exchanges_prefers_current_location_cluster(self):
         self.assertEqual(
             select_close_exchanges("ZSE", max_rtt_ms=30),
@@ -137,6 +147,32 @@ class VoidmakerCoreTest(unittest.TestCase):
                 cash_buffer=100_000,
             )
         )
+
+    async def test_local_shadow_reservation_prevents_overasking_between_inventory_ticks(self):
+        client = RecordingExchangeClient()
+        client.state.positions["LSE-CARD"] = 10
+
+        await client.add_order(PlannedOrder("LSE", "CARD", "ask", 999_999, 7), tag="landmine")
+        await client.add_order(PlannedOrder("LSE", "CARD", "ask", 250_000, 7), tag="landmine")
+
+        self.assertEqual(len(client.sent), 1)
+
+    async def test_immediate_fill_updates_local_inventory_before_next_inventory_tick(self):
+        client = RecordingExchangeClient()
+        client.state.positions["LSE-CARD"] = 25
+        await client.add_order(PlannedOrder("LSE", "CARD", "ask", 10_100, 25, "ioc"), tag="arb")
+
+        req_id = client.sent[0]["user_request_id"]
+        client.on_add_order_response(
+            {
+                "type": "add_order_response",
+                "user_request_id": req_id,
+                "success": True,
+                "data": {"immediate_inventory_change": -25, "immediate_balance_change": 252_500},
+            }
+        )
+
+        self.assertEqual(client.state.positions["LSE-CARD"], 0)
 
 
 if __name__ == "__main__":
