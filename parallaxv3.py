@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Rail-liquidity bot for the AlgoTrade 2026 exchange API — v3.
+"""Rail-liquidity bot for the AlgoTrade 2026 exchange API — v3 adaptive.
 
-Same edge as v2 (CARD AND SIMP per exchange) but with a BID LADDER
-instead of a single rail price, so we deploy most of the cash budget
-into the book at all times. A deep market sell now fills every rung
-in sequence — we end up holding more inventory per spike, and the
-`close` IOC at fair value extracts more profit per crash.
+Same edge as v2/v3 (CARD AND SIMP per exchange, bid LADDER per
+instrument) but every price — rungs, close, and force-close IOC — is
+expressed RELATIVE to the venue's current touch. Static $70 / $99
+thresholds break the moment an instrument floats anywhere other than
+~$100; here a SIMP trading at $77 still gets a meaningful ladder
+($72 / $67 / $62 / $57) and a close at the right exit price ($76).
 
-Default ladder per instrument:
+Default ladder per instrument (drops from current touch_bid):
 
-    $70 × 200,  $80 × 200,  $85 × 200,  $90 × 200
-    = 800 shares × ~$81 avg  =  $65k reserved per instrument
-    × 2 instruments per exchange  =  $130k of $150k budget deployed
+    -$5  × 200   ←  small dips     (catches every meaningful sweep)
+    -$10 × 200   ←  mid drops
+    -$15 × 200   ←  big drops
+    -$20 × 200   ←  deep crashes   (most edge per share)
 
-Force-close uses an IOC priced one cent ABOVE the highest rung so it
-can never self-trade against our own ladder; if no real bid exists
-above that, the IOC just cancels and the timer fires again next tick.
+Close fires when there's a bid within $1 of the touch (so we always
+exit at near-fair). Force-close uses an IOC priced one cent ABOVE the
+deepest live rung — it can never self-trade against our own ladder
+but does cross every external bid above that price.
 
 Standalone on purpose: copy to the team VM and run directly.
 """
@@ -64,19 +67,31 @@ EXCHANGES = (
 class RailConfig:
     exchange: str
     symbol: str
-    # Bid LADDER. Tuple of (price_cents, qty) tuples — each becomes a
-    # separate resting rail bid at its own price. A deep market sell
-    # walks through them in price order, filling every rung that the
-    # sweep reaches.
-    bid_rungs: tuple[tuple[int, int], ...]
-    # Ask LADDER. Same shape; empty by default since the close path is
-    # the long-side exit.
-    ask_rungs: tuple[tuple[int, int], ...]
-    # Close polite-IOC thresholds. The IOC fires when visible bid
-    # liquidity exists at >= close_bid_min (long exit) or visible ask
-    # liquidity at <= close_ask_max (short cover).
-    close_bid_min: int
-    close_ask_max: int
+    # Bid LADDER expressed as DROPS from the live touch_bid: tuple of
+    # (drop_cents, qty). live rung price = round(touch_bid - drop).
+    # A market sell that sweeps the touch fills every rung the sweep
+    # reaches, in order. Sort deepest first if you want big-edge rungs
+    # to win cash priority when the budget is tight.
+    bid_rung_drops: tuple[tuple[int, int], ...]
+    # Ask LADDER (lifts ABOVE touch_ask). Empty by default — close path
+    # handles long-side exit.
+    ask_rung_lifts: tuple[tuple[int, int], ...]
+    # Close fires when there's bid liquidity within close_bid_buffer_cents
+    # of touch_bid (so we exit at ~fair) or ask liquidity within
+    # close_ask_buffer_cents above touch_ask (mirror for shorts).
+    close_bid_buffer_cents: int = 100
+    close_ask_buffer_cents: int = 100
+    # If we haven't seen the touch yet (first ticks after connect),
+    # use these absolute prices as fallback. Should be roughly the
+    # ~$100 starting price of every instrument in this venue's book.
+    fallback_touch_bid: int = 9900
+    fallback_touch_ask: int = 10100
+    # Round adaptive prices to this grid (in cents) so a 1-cent touch
+    # jitter doesn't churn cancel/re-issue every tick.
+    price_grid_cents: int = 10
+    # Floor for any computed price — refuses to issue an order at, e.g.,
+    # zero if touch_bid is somehow tiny.
+    min_price_cents: int = 100
     # If we have been holding inventory for longer than this, force-flatten.
     force_close_after_ms: int = 5_000
     # Resting rails that survive this long get proactively cancelled
@@ -86,14 +101,6 @@ class RailConfig:
     @property
     def instrument(self) -> str:
         return f"{self.exchange}-{self.symbol}"
-
-    @property
-    def max_bid_rung_price(self) -> int:
-        return max((p for p, _ in self.bid_rungs), default=0)
-
-    @property
-    def min_ask_rung_price(self) -> int:
-        return min((p for p, _ in self.ask_rungs), default=10**9)
 
 
 @dataclass
@@ -139,6 +146,11 @@ class ExchangeState:
     last_flat_ms: dict[str, int] = field(default_factory=dict)
     inventory_synced: bool = False
     pending_orders_synced: bool = False
+    # Live touch per instrument, refreshed by the bot on every
+    # market_data_update. The strategy reads these to compute adaptive
+    # rung / close / force-close prices.
+    touch_bid: dict[str, int] = field(default_factory=dict)
+    touch_ask: dict[str, int] = field(default_factory=dict)
 
     def position(self, instrument: str) -> int:
         return int(self.positions.get(instrument, 0))
@@ -288,30 +300,44 @@ class ExchangeState:
             - self.inflight_ask_qty(instrument)
         )
 
+    def update_book(self, instrument: str, depth: dict[str, dict[str, int]]) -> None:
+        bids = depth.get("bids") or {}
+        asks = depth.get("asks") or {}
+        if bids:
+            try:
+                self.touch_bid[instrument] = max(int(p) for p in bids.keys())
+            except ValueError:
+                pass
+        if asks:
+            try:
+                self.touch_ask[instrument] = min(int(p) for p in asks.keys())
+            except ValueError:
+                pass
 
 
-DEFAULT_BID_LADDER: tuple[tuple[int, int], ...] = (
-    # (price_cents, qty)  — deepest first; planner sends them in this
-    # order, so the highest cash-room is reserved for the most aggressive
-    # rung and lower-margin rungs only get sized if budget remains.
-    (7000, 200),  # $70  × 200  = $14,000   — catches the deep crashes (most edge per share)
-    (8000, 200),  # $80  × 200  = $16,000
-    (8500, 200),  # $85  × 200  = $17,000
-    (9000, 200),  # $90  × 200  = $18,000
-    # total ladder reserved = $65,000 per instrument, ~$130k per exchange
-    # (CARD + SIMP), well within the $100k starting cash + $50k cash floor.
+
+DEFAULT_BID_RUNG_DROPS: tuple[tuple[int, int], ...] = (
+    # (drop_cents_below_touch_bid, qty)  — deepest first.
+    # Live rung price = round(touch_bid - drop). On a venue where SIMP
+    # touches $77, the ladder becomes $57 / $62 / $67 / $72 — still
+    # ~25-30% below market for the deepest rung, ~$5 below for the
+    # tightest. On a venue where CARD touches $99 you get $79 / $84 /
+    # $89 / $94. The ladder always tracks where price actually is.
+    (2000, 200),  # -$20  × 200  ←  catches deep crashes (most edge / share)
+    (1500, 200),  # -$15  × 200
+    (1000, 200),  # -$10  × 200
+    (500,  200),  # -$5   × 200  ←  catches every meaningful sweep
 )
 
 
 def default_rail_configs() -> dict[str, list[RailConfig]]:
-    """CARD AND SIMP traded on every exchange, with a 4-rung bid
-    ladder per instrument so most of the cash budget is deployed
-    into the order book at all times."""
+    """CARD AND SIMP traded on every exchange, with a 4-rung adaptive
+    bid ladder per instrument."""
     out: dict[str, list[RailConfig]] = {}
     for ex in EXCHANGES:
         out[ex] = [
-            RailConfig(ex, "CARD", DEFAULT_BID_LADDER, (), 9900, 10100),
-            RailConfig(ex, "SIMP", DEFAULT_BID_LADDER, (), 9900, 10100),
+            RailConfig(ex, "CARD", DEFAULT_BID_RUNG_DROPS, ()),
+            RailConfig(ex, "SIMP", DEFAULT_BID_RUNG_DROPS, ()),
         ]
     return out
 
@@ -320,6 +346,49 @@ class RailEdgeStrategy:
     def __init__(self, config: RailConfig) -> None:
         self.config = config
 
+    # ─── adaptive prices, all derived from state.touch_* ────────────────
+    def _round_down(self, p: int) -> int:
+        g = max(1, int(self.config.price_grid_cents))
+        return max(int(self.config.min_price_cents), (int(p) // g) * g)
+
+    def _round_up(self, p: int) -> int:
+        g = max(1, int(self.config.price_grid_cents))
+        return max(int(self.config.min_price_cents),
+                   ((int(p) + g - 1) // g) * g)
+
+    def live_touch_bid(self, state: ExchangeState) -> int:
+        return int(state.touch_bid.get(
+            self.config.instrument, self.config.fallback_touch_bid))
+
+    def live_touch_ask(self, state: ExchangeState) -> int:
+        return int(state.touch_ask.get(
+            self.config.instrument, self.config.fallback_touch_ask))
+
+    def live_bid_rung_prices(self, state: ExchangeState) -> list[tuple[int, int]]:
+        tb = self.live_touch_bid(state)
+        return [(self._round_down(tb - drop), int(qty))
+                for drop, qty in self.config.bid_rung_drops]
+
+    def live_ask_rung_prices(self, state: ExchangeState) -> list[tuple[int, int]]:
+        ta = self.live_touch_ask(state)
+        return [(self._round_up(ta + lift), int(qty))
+                for lift, qty in self.config.ask_rung_lifts]
+
+    def live_close_bid_min(self, state: ExchangeState) -> int:
+        return self._round_down(
+            self.live_touch_bid(state) - self.config.close_bid_buffer_cents)
+
+    def live_close_ask_max(self, state: ExchangeState) -> int:
+        return self._round_up(
+            self.live_touch_ask(state) + self.config.close_ask_buffer_cents)
+
+    def live_max_bid_rung_price(self, state: ExchangeState) -> int:
+        return max((p for p, _ in self.live_bid_rung_prices(state)), default=0)
+
+    def live_min_ask_rung_price(self, state: ExchangeState) -> int:
+        return min((p for p, _ in self.live_ask_rung_prices(state)), default=10**9)
+
+    # ────────────────────────────────────────────────────────────────────
     def apply_trade_event(self, state: ExchangeState, event: dict[str, Any]) -> None:
         data = event.get("data", event)
         order_id = data.get("passiveOrderID")
@@ -411,23 +480,33 @@ class RailEdgeStrategy:
     def _cancel_stale_rail_orders(
         self, state: ExchangeState, now_ms: int
     ) -> list[dict[str, Any]]:
+        """Cancel rails for two reasons:
+          1. Age — order older than `rail_cancel_after_ms`.
+          2. Price drift — touch moved, our rail price no longer matches
+             the current target rung price.
+        Either way the next planning pass re-issues at the right price.
+        """
         cancels = []
         max_age = int(self.config.rail_cancel_after_ms)
+        target_bids = {p for p, _ in self.live_bid_rung_prices(state)}
+        target_asks = {p for p, _ in self.live_ask_rung_prices(state)}
         for order in state.live_rail_orders(self.config.instrument):
             if order.order_id in state.inflight_cancels:
                 continue
-            if order.created_ms < 0:
-                continue
-            if int(now_ms) - int(order.created_ms) < max_age:
-                continue
-            cancels.append(
-                {
-                    "action": "cancel",
-                    "instrument_id": order.instrument,
-                    "order_id": order.order_id,
-                    "role": "stale_rail",
-                }
+            stale_by_age = (
+                order.created_ms >= 0
+                and int(now_ms) - int(order.created_ms) >= max_age
             )
+            targets = target_bids if order.side == "bid" else target_asks
+            stale_by_price = bool(targets) and int(order.price) not in targets
+            if not (stale_by_age or stale_by_price):
+                continue
+            cancels.append({
+                "action": "cancel",
+                "instrument_id": order.instrument,
+                "order_id": order.order_id,
+                "role": "stale_rail" if stale_by_age else "rail_refresh",
+            })
         return cancels
 
     def _plan_force_close(
@@ -451,11 +530,10 @@ class RailEdgeStrategy:
             return None
 
         if pos > 0:
-            # IOC ASK at max_bid_rung_price + 1: cannot match any of our own
-            # bid rungs (all at <= max), but crosses every external bid
-            # >= that price (MM, other teams). Most of the time MM has bids
-            # at $98–$100 so the IOC sells at near-fair value.
-            ioc_price = max(1, self.config.max_bid_rung_price + 1)
+            # IOC ASK at live_max_bid_rung_price + 1: cannot match any of
+            # our own bid rungs (all at <= max), but crosses every external
+            # bid >= that price.
+            ioc_price = max(1, self.live_max_bid_rung_price(state) + 1)
             qty = min(pos, max(0, state.free_qty(instrument)))
             if qty <= 0:
                 return None
@@ -466,7 +544,7 @@ class RailEdgeStrategy:
             )
 
         # short side
-        ioc_price = max(2, self.config.min_ask_rung_price - 1)
+        ioc_price = max(2, self.live_min_ask_rung_price(state) - 1)
         qty = min(-pos, max(0, state.free_cash() // max(1, ioc_price)))
         if qty <= 0:
             return None
@@ -485,40 +563,30 @@ class RailEdgeStrategy:
         instrument = self.config.instrument
         pos = state.position(instrument)
         if pos > 0:
+            close_px = self.live_close_bid_min(state)
             free = max(0, state.free_qty(instrument))
             qty = min(
-                free,
-                pos,
-                visible_qty_at_or_better(
-                    depth.get("bids", {}), self.config.close_bid_min, "bid"
-                ),
+                free, pos,
+                visible_qty_at_or_better(depth.get("bids", {}), close_px, "bid"),
             )
             if qty > 0:
                 return self._order(
-                    instrument=instrument,
-                    side="ask",
-                    price=self.config.close_bid_min,
-                    quantity=qty,
-                    order_type="ioc",
-                    role="close",
+                    instrument=instrument, side="ask",
+                    price=close_px, quantity=qty,
+                    order_type="ioc", role="close",
                 )
 
         if pos < 0:
-            visible = visible_qty_at_or_better(
-                depth.get("asks", {}), self.config.close_ask_max, "ask"
-            )
-            cash_qty = state.free_cash() // self.config.close_ask_max
+            close_px = self.live_close_ask_max(state)
+            visible = visible_qty_at_or_better(depth.get("asks", {}), close_px, "ask")
+            cash_qty = state.free_cash() // max(1, close_px)
             qty = max(0, min(-pos, visible, cash_qty))
             if qty > 0:
                 return self._order(
-                    instrument=instrument,
-                    side="bid",
-                    price=self.config.close_ask_max,
-                    quantity=qty,
-                    order_type="ioc",
-                    role="close",
+                    instrument=instrument, side="bid",
+                    price=close_px, quantity=qty,
+                    order_type="ioc", role="close",
                 )
-
         return None
 
     def _normal_close_blocked_by_ask_reservation(
@@ -526,13 +594,11 @@ class RailEdgeStrategy:
     ) -> bool:
         if not depth:
             return False
-
         instrument = self.config.instrument
         if state.position(instrument) <= 0:
             return False
-
         visible_qty = visible_qty_at_or_better(
-            depth.get("bids", {}), self.config.close_bid_min, "bid"
+            depth.get("bids", {}), self.live_close_bid_min(state), "bid"
         )
         return visible_qty > 0 and state.pending_qty(instrument, side="ask") > 0
 
@@ -554,21 +620,15 @@ class RailEdgeStrategy:
     def _plan_rail_bid_rungs(
         self, state: ExchangeState, extra_reserved_value: int = 0
     ) -> list[dict[str, Any]]:
-        """Place one rail bid per (price, qty) rung from `bid_rungs`.
-
-        Cash budget is decremented as we plan, so deeper rungs (which
-        appear FIRST in the ladder) always get priority — if there's
-        not enough room for everything, lower-edge rungs are simply
-        skipped this tick.
-        """
+        """Place one rail bid per LIVE (price, qty) rung. Prices are
+        recomputed every tick from state.touch_bid via
+        live_bid_rung_prices, so the ladder follows the actual market."""
         instrument = self.config.instrument
         out: list[dict[str, Any]] = []
         free = state.free_cash() - int(extra_reserved_value)
-        # Total bids already pending across all rungs — counts against
-        # the position ceiling so we don't promise more than +2000 long.
         total_bid_pending = state.pending_qty(instrument, side="bid", role="rail")
         running_position = state.position(instrument) + total_bid_pending
-        for price, target_qty in self.config.bid_rungs:
+        for price, target_qty in self.live_bid_rung_prices(state):
             pending_at_rung = state.pending_qty(
                 instrument, side="bid", price=price, role="rail"
             )
@@ -592,12 +652,11 @@ class RailEdgeStrategy:
     def _plan_rail_ask_rungs(
         self, state: ExchangeState, extra_reserved_qty: int = 0
     ) -> list[dict[str, Any]]:
-        """Place one rail ask per (price, qty) rung from `ask_rungs`,
-        sized to free shares. Off by default (ask_rungs = ())."""
+        """Same shape as the bid ladder, prices live from touch_ask."""
         instrument = self.config.instrument
         out: list[dict[str, Any]] = []
         free = state.free_qty(instrument) - int(extra_reserved_qty)
-        for price, target_qty in self.config.ask_rungs:
+        for price, target_qty in self.live_ask_rung_prices(state):
             pending_at_rung = state.pending_qty(
                 instrument, side="ask", price=price, role="rail"
             )
@@ -835,6 +894,13 @@ class RailEdgeBot:
                                     state.drop_order(int(order_id))
 
                         depths = message.get("orderbook_depths", {})
+                        # Refresh the live touch for every instrument BEFORE
+                        # any strategy plans, so the adaptive rung / close /
+                        # force-close prices reflect the latest book.
+                        for strategy in strategies:
+                            d = depths.get(strategy.config.instrument)
+                            if d is not None:
+                                state.update_book(strategy.config.instrument, d)
                         # Plan and dispatch each strategy in sequence; each
                         # strategy's track_inflight call updates state so the
                         # next strategy's free_cash() / free_qty() reflect
