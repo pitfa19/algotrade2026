@@ -79,16 +79,20 @@ class RailConfig:
     # Close fires when there's bid liquidity within close_bid_buffer_cents
     # of touch_bid (so we exit at ~fair) or ask liquidity within
     # close_ask_buffer_cents above touch_ask (mirror for shorts).
-    close_bid_buffer_cents: int = 100
-    close_ask_buffer_cents: int = 100
+    # Must be SMALLER than every bid_rung_drop (otherwise the close price
+    # would sit below or at the rung price and we'd lock in a loss).
+    # 20c keeps profit on the tightest -$0.50 rung at +30c/share.
+    close_bid_buffer_cents: int = 20
+    close_ask_buffer_cents: int = 20
     # If we haven't seen the touch yet (first ticks after connect),
     # use these absolute prices as fallback. Should be roughly the
     # ~$100 starting price of every instrument in this venue's book.
     fallback_touch_bid: int = 9900
     fallback_touch_ask: int = 10100
-    # Round adaptive prices to this grid (in cents) so a 1-cent touch
-    # jitter doesn't churn cancel/re-issue every tick.
-    price_grid_cents: int = 10
+    # Round adaptive prices to this grid (in cents) so small touch
+    # moves don't churn cancel/re-issue. 25c is wide enough to absorb
+    # normal jitter, narrow enough that the tightest rung still tracks.
+    price_grid_cents: int = 25
     # Floor for any computed price — refuses to issue an order at, e.g.,
     # zero if touch_bid is somehow tiny.
     min_price_cents: int = 100
@@ -318,15 +322,16 @@ class ExchangeState:
 
 DEFAULT_BID_RUNG_DROPS: tuple[tuple[int, int], ...] = (
     # (drop_cents_below_touch_bid, qty)  — deepest first.
-    # Live rung price = round(touch_bid - drop). On a venue where SIMP
-    # touches $77, the ladder becomes $57 / $62 / $67 / $72 — still
-    # ~25-30% below market for the deepest rung, ~$5 below for the
-    # tightest. On a venue where CARD touches $99 you get $79 / $84 /
-    # $89 / $94. The ladder always tracks where price actually is.
-    (2000, 200),  # -$20  × 200  ←  catches deep crashes (most edge / share)
-    (1500, 200),  # -$15  × 200
-    (1000, 200),  # -$10  × 200
-    (500,  200),  # -$5   × 200  ←  catches every meaningful sweep
+    # Live rung price = round(touch_bid - drop).
+    #
+    # Even $1-below-touch was too far on calm venues — the only sweeps
+    # that walked there were already big crashes. Tightening so the
+    # nearest rung sits just half a dollar below touch fires on any
+    # sweep that walks more than a couple MM levels.
+    (1000, 200),  # -$10    × 200  ←  deep crash (most edge / share)
+    (500,  200),  # -$5     × 200
+    (200,  200),  # -$2     × 200
+    (50,   200),  # -$0.50  × 200  ←  fires on most meaningful sweeps
 )
 
 
