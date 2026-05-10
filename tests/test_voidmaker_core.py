@@ -6,10 +6,12 @@ from voidmaker import (
     LandmineConfig,
     LandmineFill,
     build_landmine_orders,
+    can_submit_order,
     estimate_landmine_profit_cents,
     find_cross_venue_arbs,
     select_close_exchanges,
     unprotected_position,
+    PlannedOrder,
 )
 
 
@@ -95,6 +97,46 @@ class VoidmakerCoreTest(unittest.TestCase):
         self.assertEqual(unprotected_position(actual=25, protected=40), 0)
         self.assertEqual(unprotected_position(actual=-25, protected=-40), 0)
         self.assertEqual(unprotected_position(actual=20, protected=-20), 20)
+
+    def test_can_submit_order_blocks_asks_without_available_inventory(self):
+        order = PlannedOrder("LSE", "CARD", "ask", 10_100, 25, "ioc")
+
+        self.assertFalse(
+            can_submit_order(
+                order,
+                cash_total=10_000_000,
+                cash_reserved=0,
+                position_total=0,
+                position_reserved=0,
+                allow_short=False,
+            )
+        )
+        self.assertTrue(
+            can_submit_order(
+                order,
+                cash_total=10_000_000,
+                cash_reserved=0,
+                position_total=30,
+                position_reserved=5,
+                allow_short=False,
+            )
+        )
+
+    def test_can_submit_order_blocks_bids_without_cash_headroom(self):
+        order = PlannedOrder("ZSE", "CARD", "bid", 10_000, 100, "ioc")
+
+        self.assertFalse(
+            can_submit_order(
+                order,
+                cash_total=-4_950_000,
+                cash_reserved=0,
+                position_total=0,
+                position_reserved=0,
+                allow_short=False,
+                min_cash=-5_000_000,
+                cash_buffer=100_000,
+            )
+        )
 
 
 if __name__ == "__main__":

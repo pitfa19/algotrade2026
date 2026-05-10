@@ -144,6 +144,10 @@ class LandmineConfig:
     arb_interval_s: float = 0.05
     arb_cooldown_s: float = 0.15
     arb_max_per_cycle: int = 8
+    allow_short: bool = False
+    min_cash: int = -5_000_000
+    cash_buffer: int = 100_000
+    short_floor: int = -200
     expiry_ms: int = 20 * 60 * 1000
     request_timeout_ms: int = 5_000
 
@@ -245,6 +249,41 @@ def unprotected_position(actual: int, protected: int) -> int:
     return actual - protected
 
 
+def available_cash_to_spend(cash_total: int, cash_reserved: int, min_cash: int, cash_buffer: int) -> int:
+    return max(0, cash_total - cash_reserved - min_cash - cash_buffer)
+
+
+def available_inventory_to_sell(
+    position_total: int,
+    position_reserved: int,
+    allow_short: bool,
+    short_floor: int = -200,
+) -> int:
+    if allow_short:
+        return max(0, position_total - position_reserved - short_floor)
+    return max(0, position_total - position_reserved)
+
+
+def can_submit_order(
+    order: PlannedOrder,
+    cash_total: int,
+    cash_reserved: int,
+    position_total: int,
+    position_reserved: int,
+    allow_short: bool,
+    min_cash: int = -5_000_000,
+    cash_buffer: int = 100_000,
+    short_floor: int = -200,
+) -> bool:
+    if order.side == "bid":
+        if order.price <= 0:
+            return False
+        spendable = available_cash_to_spend(cash_total, cash_reserved, min_cash, cash_buffer)
+        return order.price * order.quantity <= spendable
+    sellable = available_inventory_to_sell(position_total, position_reserved, allow_short, short_floor)
+    return order.quantity <= sellable
+
+
 class TokenBucket:
     def __init__(self, rate_per_second: int) -> None:
         self.rate = float(rate_per_second)
@@ -271,8 +310,10 @@ class TokenBucket:
 class ExchangeState:
     books: dict[str, BookTop] = field(default_factory=dict)
     positions: dict[str, int] = field(default_factory=dict)
+    position_reserved: dict[str, int] = field(default_factory=dict)
     arb_inventory: dict[str, int] = field(default_factory=dict)
     cash: int = 10_000_000
+    cash_reserved: int = 0
     active_order_keys: set[tuple[str, Side, int]] = field(default_factory=set)
     request_keys: dict[str, tuple[str, Side, int]] = field(default_factory=dict)
     request_tags: dict[str, str] = field(default_factory=dict)
@@ -388,10 +429,12 @@ class ExchangeClient:
         data = msg.get("data") or {}
         cash = data.get("$")
         if isinstance(cash, list) and len(cash) >= 2:
+            self.state.cash_reserved = int(cash[0])
             self.state.cash = int(cash[1])
         for instrument_id, pair in data.items():
             if instrument_id == "$" or not isinstance(pair, list) or len(pair) < 2:
                 continue
+            self.state.position_reserved[instrument_id] = int(pair[0])
             self.state.positions[instrument_id] = int(pair[1])
 
     def on_pending(self, msg: dict[str, Any]) -> None:
@@ -424,7 +467,22 @@ class ExchangeClient:
             if message:
                 print(f"[{self.exchange}] add rejected: {message}", flush=True)
 
+    def can_submit(self, order: PlannedOrder) -> bool:
+        return can_submit_order(
+            order,
+            cash_total=self.state.cash,
+            cash_reserved=self.state.cash_reserved,
+            position_total=self.state.positions.get(order.instrument_id, 0),
+            position_reserved=self.state.position_reserved.get(order.instrument_id, 0),
+            allow_short=self.cfg.allow_short,
+            min_cash=self.cfg.min_cash,
+            cash_buffer=self.cfg.cash_buffer,
+            short_floor=self.cfg.short_floor,
+        )
+
     async def add_order(self, order: PlannedOrder, expiry_ms: int | None = None, tag: str = "") -> None:
+        if not self.can_submit(order):
+            return
         req_id = self.next_id("add")
         key = (order.instrument_id, order.side, order.price)
         self.state.request_tags[req_id] = tag
@@ -464,7 +522,15 @@ class ExchangeClient:
                 continue
             ticker = instrument_id.split("-", 1)[1]
             if pos > 0 and book.best_bid is not None and book.best_bid >= self.cfg.min_exit_price:
-                qty = min(pos, self.cfg.liquidation_ioc_qty, max(1, book.best_bid_qty))
+                sellable = available_inventory_to_sell(
+                    self.state.positions.get(instrument_id, 0),
+                    self.state.position_reserved.get(instrument_id, 0),
+                    self.cfg.allow_short,
+                    self.cfg.short_floor,
+                )
+                qty = min(pos, sellable, self.cfg.liquidation_ioc_qty, max(1, book.best_bid_qty))
+                if qty <= 0:
+                    continue
                 await self.add_order(
                     PlannedOrder(self.exchange, ticker, "ask", book.best_bid, qty, "ioc"),
                     expiry_ms=int(time.time() * 1000) + self.cfg.request_timeout_ms,
@@ -521,14 +587,18 @@ class MarketHub:
                 continue
             buy_client = self.clients[opp.buy_exchange]
             sell_client = self.clients[opp.sell_exchange]
+            buy_order = PlannedOrder(opp.buy_exchange, opp.ticker, "bid", opp.buy_price, opp.quantity, "ioc")
+            sell_order = PlannedOrder(opp.sell_exchange, opp.ticker, "ask", opp.sell_price, opp.quantity, "ioc")
+            if not buy_client.can_submit(buy_order) or not sell_client.can_submit(sell_order):
+                continue
             await asyncio.gather(
                 buy_client.add_order(
-                    PlannedOrder(opp.buy_exchange, opp.ticker, "bid", opp.buy_price, opp.quantity, "ioc"),
+                    buy_order,
                     expiry_ms=int(time.time() * 1000) + self.cfg.request_timeout_ms,
                     tag="arb",
                 ),
                 sell_client.add_order(
-                    PlannedOrder(opp.sell_exchange, opp.ticker, "ask", opp.sell_price, opp.quantity, "ioc"),
+                    sell_order,
                     expiry_ms=int(time.time() * 1000) + self.cfg.request_timeout_ms,
                     tag="arb",
                 ),
@@ -551,6 +621,8 @@ def config_from_env(args: argparse.Namespace) -> LandmineConfig:
         max_msgs_per_second=int_env("VOID_MSG_RATE", args.msg_rate),
         arb_min_spread_cents=int_env("VOID_ARB_MIN_SPREAD", args.arb_min_spread),
         arb_clip_qty=int_env("VOID_ARB_CLIP_QTY", args.arb_clip_qty),
+        allow_short=bool(int(os.environ.get("VOID_ALLOW_SHORT", "1" if args.allow_short else "0"))),
+        cash_buffer=int_env("VOID_CASH_BUFFER", args.cash_buffer),
     )
 
 
@@ -564,6 +636,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--msg-rate", type=int, default=450)
     parser.add_argument("--arb-min-spread", type=int, default=25)
     parser.add_argument("--arb-clip-qty", type=int, default=25)
+    parser.add_argument("--cash-buffer", type=int, default=100_000)
+    parser.add_argument("--allow-short", action="store_true", default=os.environ.get("VOID_ALLOW_SHORT") == "1")
     parser.add_argument("--no-arb", action="store_true", default=os.environ.get("VOID_NO_ARB") == "1")
     parser.add_argument("--dry-plan", action="store_true", help="print selected exchanges and planned instruments, then exit")
     return parser.parse_args()
