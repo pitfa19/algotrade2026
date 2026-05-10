@@ -58,13 +58,14 @@ class RailConfig:
     # With a 10_000c median, the defaults quote 9_970, 9_940, and 9_900.
     bid_rungs: tuple[tuple[int, int], ...] = ((30, 60), (60, 80), (100, 100))
     # Sell long inventory as soon as visible bids are within this many cents
-    # below cross median. This is the turnover dial.
-    close_discount_cents: int = 5
+    # below cross median. Replay showed 5c was too eager and fed the market
+    # force-close path; 20c kept turnover high without dumping every wiggle.
+    close_discount_cents: int = 20
     # Fallback anchor until enough venues have fresh books.
     fallback_anchor_price: int = 10_000
     median_min_venues: int = 3
     median_max_age_ms: int = 1_000
-    force_close_after_ms: int = 4_000
+    force_close_after_ms: int = 30_000
     rail_cancel_after_ms: int = 8_000
     rail_reprice_threshold: int = 10
     rail_reprice_min_age_ms: int = 1_000

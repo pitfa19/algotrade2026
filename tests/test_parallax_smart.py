@@ -70,8 +70,21 @@ class SmartRailStrategyTests(unittest.TestCase):
         self.assertEqual(len(close), 1)
         self.assertEqual(
             (close[0]["side"], close[0]["order_type"], close[0]["price"], close[0]["quantity"]),
-            ("ask", "ioc", 9_995, 50),
+            ("ask", "ioc", 9_980, 50),
         )
+
+    def test_default_force_close_waits_for_sustained_stuck_inventory(self):
+        config = default_rail_configs()["NYSE"][0]
+        state = synced_state("NYSE")
+        state.positions[config.instrument] = 50
+        state.last_flat_ms[config.instrument] = 0
+        strategy = RailEdgeStrategy(config)
+
+        early = strategy.plan_orders(state, depth(9_500, 9_510), now_ms=10_000)
+        late = strategy.plan_orders(state, depth(9_500, 9_510), now_ms=30_001)
+
+        self.assertFalse(any(order.get("role") == "force_close" for order in early))
+        self.assertTrue(any(order.get("role") == "force_close" for order in late))
 
     def test_live_rung_reprices_when_cross_median_moves(self):
         config = RailConfig(
