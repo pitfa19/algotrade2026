@@ -83,7 +83,8 @@ class RailConfig:
     median_anchor_base: int = 10_000
     median_min_venues: int = 3
     median_max_age_ms: int = 1_000
-    rail_reprice_threshold: int = 50
+    rail_reprice_threshold: int = 200
+    rail_reprice_min_age_ms: int = 2_000
 
     @property
     def instrument(self) -> str:
@@ -172,8 +173,9 @@ class ExchangeState:
         quantity: int,
         role: str,
         created_ms: int = -1,
+        reserve: bool = False,
     ) -> None:
-        self.live_orders[int(order_id)] = LiveOrder(
+        order = LiveOrder(
             local_id=local_id,
             order_id=int(order_id),
             instrument=instrument,
@@ -183,10 +185,45 @@ class ExchangeState:
             role=role,
             created_ms=int(created_ms),
         )
+        self.live_orders[int(order_id)] = order
+        if reserve:
+            self.reserve_order(order)
 
-    def drop_order(self, order_id: int) -> None:
+    def reserve_order(self, order: LiveOrder) -> None:
+        quantity = max(0, int(order.remaining))
+        if quantity <= 0:
+            return
+        if order.side == "bid":
+            self.reserved_cash += int(order.price) * quantity
+        else:
+            self.reserved_qty[order.instrument] += quantity
+
+    def release_order_reservation(
+        self, order: LiveOrder, quantity: int | None = None
+    ) -> None:
+        release_qty = order.remaining if quantity is None else min(order.remaining, int(quantity))
+        release_qty = max(0, int(release_qty))
+        if release_qty <= 0:
+            return
+        if order.side == "bid":
+            self.reserved_cash = max(
+                0, self.reserved_cash - int(order.price) * release_qty
+            )
+        else:
+            self.reserved_qty[order.instrument] = max(
+                0, self.reserved_qty[order.instrument] - release_qty
+            )
+
+    def drop_order(self, order_id: int, *, release_reserved: bool = False) -> None:
+        order = self.live_orders.get(int(order_id))
+        if release_reserved and order is not None:
+            self.release_order_reservation(order)
         self.live_orders.pop(int(order_id), None)
         self.inflight_cancels.discard(int(order_id))
+
+    def mark_unsynced(self) -> None:
+        self.inventory_synced = False
+        self.pending_orders_synced = False
 
     def track_inflight(self, order: PendingOrder) -> None:
         self.inflight_orders[order.local_id] = order
@@ -440,6 +477,7 @@ class RailEdgeStrategy:
         if quantity <= 0:
             return
 
+        state.release_order_reservation(order, quantity)
         if order.side == "bid":
             state.positions[order.instrument] = state.position(order.instrument) + quantity
             state.cash -= price * quantity
@@ -614,10 +652,15 @@ class RailEdgeStrategy:
             if order.order_id in state.inflight_cancels:
                 continue
             target_price = prices.rail_bid if order.side == "bid" else prices.high_ask
-            needs_reprice = abs(int(order.price) - int(target_price)) >= int(
-                self.config.rail_reprice_threshold
+            age_ms = int(now_ms) - int(order.created_ms) if order.created_ms >= 0 else 0
+            old_enough_to_reprice = (
+                order.created_ms >= 0
+                and age_ms >= int(self.config.rail_reprice_min_age_ms)
             )
-            is_stale = order.created_ms >= 0 and int(now_ms) - int(order.created_ms) >= max_age
+            needs_reprice = old_enough_to_reprice and abs(
+                int(order.price) - int(target_price)
+            ) >= int(self.config.rail_reprice_threshold)
+            is_stale = order.created_ms >= 0 and age_ms >= max_age
             if not needs_reprice and not is_stale:
                 continue
             cancels.append(
@@ -992,7 +1035,7 @@ class RailEdgeBot:
                                 data = event.get("data", {})
                                 order_id = data.get("orderID")
                                 if order_id is not None:
-                                    state.drop_order(int(order_id))
+                                    state.drop_order(int(order_id), release_reserved=True)
 
                         depths = message.get("orderbook_depths", {})
                         self.oracle.update_many(depths, now_ms)
@@ -1090,6 +1133,7 @@ class RailEdgeBot:
         if not message.get("success"):
             msg = (data or {}).get("message") if isinstance(data, dict) else None
             print(f"[{exchange}] add_order failed: {msg}", flush=True)
+            state.mark_unsynced()
             return True
 
         had_fill = bool(
@@ -1116,9 +1160,12 @@ class RailEdgeBot:
                         quantity=resting_qty,
                         role=order.role,
                         created_ms=order.created_ms,
+                        reserve=True,
                     )
         else:
             strategy.apply_immediate_fill(state, order, data)
+        if had_fill:
+            state.mark_unsynced()
         return had_fill
 
     def _hydrate_live_orders(self, state: ExchangeState, data: dict[str, Any]) -> None:
@@ -1167,7 +1214,7 @@ class RailEdgeBot:
             return
 
         if message.get("success"):
-            state.drop_order(order_id)
+            state.drop_order(order_id, release_reserved=True)
         else:
             print(f"[{exchange}] cancel_order failed: {message.get('message')}", flush=True)
             state.drop_cancel(order_id)
