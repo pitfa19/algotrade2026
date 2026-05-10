@@ -6,6 +6,7 @@ from voidmaker import (
     ExchangeClient,
     LandmineConfig,
     LandmineFill,
+    MarketHub,
     PlannedOrder,
     build_landmine_orders,
     can_submit_order,
@@ -17,8 +18,8 @@ from voidmaker import (
 
 
 class RecordingExchangeClient(ExchangeClient):
-    def __init__(self):
-        super().__init__("LSE", LandmineConfig())
+    def __init__(self, exchange="LSE", cfg=None):
+        super().__init__(exchange, cfg or LandmineConfig())
         self.sent = []
 
     async def send(self, payload):
@@ -173,6 +174,66 @@ class VoidmakerCoreTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(client.state.positions["LSE-CARD"], 0)
+
+    async def test_seed_inventory_buys_when_below_target(self):
+        client = RecordingExchangeClient()
+        client.cfg = LandmineConfig(seed_inventory_qty=20, seed_clip_qty=7)
+        client.state.books["LSE-CARD"] = BookTop(best_bid=9_998, best_ask=10_002, best_bid_qty=50, best_ask_qty=11)
+
+        await client.seed_inventory()
+
+        self.assertEqual(len(client.sent), 1)
+        self.assertEqual(client.sent[0]["side"], "bid")
+        self.assertEqual(client.sent[0]["order_type"], "ioc")
+        self.assertEqual(client.sent[0]["price"], 10_002)
+        self.assertEqual(client.sent[0]["quantity"], 7)
+
+    async def test_seed_inventory_does_not_rebuy_intentional_arb_sale(self):
+        client = RecordingExchangeClient()
+        client.cfg = LandmineConfig(seed_inventory_qty=20, seed_clip_qty=10)
+        client.state.positions["LSE-CARD"] = 0
+        client.state.arb_inventory["LSE-CARD"] = -20
+        client.state.books["LSE-CARD"] = BookTop(best_bid=10_500, best_ask=10_502, best_bid_qty=50, best_ask_qty=50)
+
+        await client.seed_inventory()
+
+        self.assertEqual(client.sent, [])
+
+    async def test_liquidation_preserves_seed_inventory_target(self):
+        client = RecordingExchangeClient()
+        client.cfg = LandmineConfig(seed_inventory_qty=20)
+        client.state.positions["LSE-CARD"] = 20
+        client.state.books["LSE-CARD"] = BookTop(best_bid=10_000, best_ask=10_002, best_bid_qty=50, best_ask_qty=50)
+
+        await client.liquidate_inventory()
+
+        self.assertEqual(client.sent, [])
+
+    async def test_landmine_asks_do_not_reserve_seed_inventory(self):
+        client = RecordingExchangeClient()
+        client.cfg = LandmineConfig(seed_inventory_qty=20)
+        client.state.positions["LSE-CARD"] = 20
+        client.state.books["LSE-CARD"] = BookTop(best_bid=10_000, best_ask=10_002, best_bid_qty=50, best_ask_qty=50)
+
+        await client.seed_landmines()
+
+        self.assertTrue(client.sent)
+        self.assertTrue(all(payload["side"] == "bid" for payload in client.sent))
+
+    async def test_market_hub_downsizes_arb_to_sellable_inventory(self):
+        cfg = LandmineConfig(arb_min_spread_cents=20, arb_clip_qty=25, seed_inventory_qty=20)
+        buy_client = RecordingExchangeClient("ZSE", cfg)
+        sell_client = RecordingExchangeClient("LSE", cfg)
+        buy_client.state.books["ZSE-CARD"] = BookTop(best_bid=10_000, best_ask=10_000, best_bid_qty=50, best_ask_qty=50)
+        sell_client.state.books["LSE-CARD"] = BookTop(best_bid=10_100, best_ask=10_110, best_bid_qty=50, best_ask_qty=50)
+        sell_client.state.positions["LSE-CARD"] = 20
+
+        await MarketHub({"ZSE": buy_client, "LSE": sell_client}, cfg).scan_once()
+
+        self.assertEqual(len(buy_client.sent), 1)
+        self.assertEqual(len(sell_client.sent), 1)
+        self.assertEqual(buy_client.sent[0]["quantity"], 20)
+        self.assertEqual(sell_client.sent[0]["quantity"], 20)
 
 
 if __name__ == "__main__":

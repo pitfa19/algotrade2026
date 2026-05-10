@@ -148,6 +148,9 @@ class LandmineConfig:
     min_cash: int = -5_000_000
     cash_buffer: int = 100_000
     short_floor: int = -200
+    seed_inventory_qty: int = 20
+    seed_clip_qty: int = 10
+    seed_interval_s: float = 0.5
     expiry_ms: int = 20 * 60 * 1000
     request_timeout_ms: int = 5_000
 
@@ -321,6 +324,7 @@ class ExchangeState:
     request_orders: dict[str, PlannedOrder] = field(default_factory=dict)
     request_tags: dict[str, str] = field(default_factory=dict)
     last_seed_s: float = 0.0
+    last_inventory_seed_s: float = 0.0
     last_inventory_s: float = 0.0
     last_pending_s: float = 0.0
     server_time_ms: int = 0
@@ -415,6 +419,9 @@ class ExchangeClient:
         if now - self.state.last_pending_s >= self.cfg.pending_interval_s:
             self.state.last_pending_s = now
             await self.request_pending()
+        if self.cfg.seed_inventory_qty > 0 and now - self.state.last_inventory_seed_s >= self.cfg.seed_interval_s:
+            self.state.last_inventory_seed_s = now
+            await self.seed_inventory()
         if now - self.state.last_seed_s >= self.cfg.reseed_interval_s:
             self.state.last_seed_s = now
             await self.seed_landmines()
@@ -538,16 +545,48 @@ class ExchangeClient:
             instrument_id = f"{self.exchange}-{ticker}"
             book = self.state.books.get(instrument_id, BookTop(None, None))
             for order in build_landmine_orders(self.exchange, ticker, book, self.cfg):
+                if order.side == "ask" and not self.cfg.allow_short:
+                    sellable = available_inventory_to_sell(
+                        self.state.positions.get(instrument_id, 0),
+                        self.state.position_reserved.get(instrument_id, 0)
+                        + self.state.local_position_reserved.get(instrument_id, 0),
+                        False,
+                        self.cfg.short_floor,
+                    )
+                    if sellable - order.quantity < self.cfg.seed_inventory_qty:
+                        continue
                 key = (order.instrument_id, order.side, order.price)
                 if key in self.state.active_order_keys or key in self.state.request_keys.values():
                     continue
                 await self.add_order(order, tag="landmine")
+
+    async def seed_inventory(self) -> None:
+        for ticker in INSTRUMENTS_BY_EXCHANGE[self.exchange]:
+            instrument_id = f"{self.exchange}-{ticker}"
+            book = self.state.books.get(instrument_id)
+            if book is None or book.best_ask is None or book.best_ask_qty <= 0:
+                continue
+            position = self.state.positions.get(instrument_id, 0) - min(0, self.state.arb_inventory.get(instrument_id, 0))
+            reserved = self.state.position_reserved.get(instrument_id, 0) + self.state.local_position_reserved.get(instrument_id, 0)
+            gap = self.cfg.seed_inventory_qty - position - reserved
+            if gap <= 0:
+                continue
+            qty = min(gap, self.cfg.seed_clip_qty, book.best_ask_qty)
+            if qty <= 0:
+                continue
+            await self.add_order(
+                PlannedOrder(self.exchange, ticker, "bid", book.best_ask, qty, "ioc"),
+                expiry_ms=int(time.time() * 1000) + self.cfg.request_timeout_ms,
+                tag="seed",
+            )
 
     async def liquidate_inventory(self) -> None:
         for instrument_id, pos in list(self.state.positions.items()):
             if not instrument_id.startswith(f"{self.exchange}-") or pos == 0:
                 continue
             pos = unprotected_position(pos, self.state.arb_inventory.get(instrument_id, 0))
+            if pos > 0:
+                pos = max(0, pos - self.cfg.seed_inventory_qty)
             if pos == 0:
                 continue
             book = self.state.books.get(instrument_id)
@@ -620,8 +659,26 @@ class MarketHub:
                 continue
             buy_client = self.clients[opp.buy_exchange]
             sell_client = self.clients[opp.sell_exchange]
-            buy_order = PlannedOrder(opp.buy_exchange, opp.ticker, "bid", opp.buy_price, opp.quantity, "ioc")
-            sell_order = PlannedOrder(opp.sell_exchange, opp.ticker, "ask", opp.sell_price, opp.quantity, "ioc")
+            sell_instrument = f"{opp.sell_exchange}-{opp.ticker}"
+            sellable_qty = available_inventory_to_sell(
+                sell_client.state.positions.get(sell_instrument, 0),
+                sell_client.state.position_reserved.get(sell_instrument, 0)
+                + sell_client.state.local_position_reserved.get(sell_instrument, 0),
+                sell_client.cfg.allow_short,
+                sell_client.cfg.short_floor,
+            )
+            spendable_cash = available_cash_to_spend(
+                buy_client.state.cash,
+                buy_client.state.cash_reserved + buy_client.state.local_cash_reserved,
+                buy_client.cfg.min_cash,
+                buy_client.cfg.cash_buffer,
+            )
+            affordable_qty = spendable_cash // opp.buy_price if opp.buy_price > 0 else 0
+            qty = min(opp.quantity, sellable_qty, affordable_qty)
+            if qty <= 0:
+                continue
+            buy_order = PlannedOrder(opp.buy_exchange, opp.ticker, "bid", opp.buy_price, qty, "ioc")
+            sell_order = PlannedOrder(opp.sell_exchange, opp.ticker, "ask", opp.sell_price, qty, "ioc")
             if not buy_client.can_submit(buy_order) or not sell_client.can_submit(sell_order):
                 continue
             await asyncio.gather(
@@ -656,6 +713,8 @@ def config_from_env(args: argparse.Namespace) -> LandmineConfig:
         arb_clip_qty=int_env("VOID_ARB_CLIP_QTY", args.arb_clip_qty),
         allow_short=bool(int(os.environ.get("VOID_ALLOW_SHORT", "1" if args.allow_short else "0"))),
         cash_buffer=int_env("VOID_CASH_BUFFER", args.cash_buffer),
+        seed_inventory_qty=int_env("VOID_SEED_INVENTORY_QTY", args.seed_inventory_qty),
+        seed_clip_qty=int_env("VOID_SEED_CLIP_QTY", args.seed_clip_qty),
     )
 
 
@@ -670,6 +729,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arb-min-spread", type=int, default=25)
     parser.add_argument("--arb-clip-qty", type=int, default=25)
     parser.add_argument("--cash-buffer", type=int, default=100_000)
+    parser.add_argument("--seed-inventory-qty", type=int, default=20)
+    parser.add_argument("--seed-clip-qty", type=int, default=10)
     parser.add_argument("--allow-short", action="store_true", default=os.environ.get("VOID_ALLOW_SHORT") == "1")
     parser.add_argument("--no-arb", action="store_true", default=os.environ.get("VOID_NO_ARB") == "1")
     parser.add_argument("--dry-plan", action="store_true", help="print selected exchanges and planned instruments, then exit")
