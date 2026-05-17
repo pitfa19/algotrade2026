@@ -1,5 +1,21 @@
 __pycache__/
 *.pyc
+*.pyo
 .venv/
 venv/
 market_data/
+
+# Build artefacts
+/bot
+bots/cpp/bot
+bots/cpp/build/
+
+# Empty / scratch
+data.ipynb
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# Claude Code worktrees (local scratch)
+.claude/worktrees/

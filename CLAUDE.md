@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A trading bot for the **AlgoTrade 2026 hackathon** (May 2026, Zagreb) — a simulated multi-exchange algo-trading competition run by X.FER / FER Zagreb. The repo is currently a blank slate; the bot has not been written yet.
+Trading bots and research tooling for the **AlgoTrade 2026 hackathon** (May 2026, Zagreb) — a simulated multi-exchange algo-trading competition run by X.FER / FER Zagreb. Active strategies live in `bots/` (one file per bot); older iterations are kept under `bots/archive/` for diffability. Tests run with stdlib `unittest` or `pytest`. See `README.md` for the full layout.
 
 ## Documentation
 
@@ -46,6 +46,7 @@ These are the non-obvious rules that shape architecture decisions:
 
 ## Conventions for this repo
 
-- Language is open — Python and C++ both have reference scaffolds upstream. No choice has been made yet in this repo.
-- No build, lint, or test commands exist yet. Do not invent them; ask before adding tooling.
+- Active strategies live in `bots/`; older iterations are archived under `bots/archive/`. The C++ port and CMake build sit in `bots/cpp/`.
+- Tests use stdlib `unittest` (or `pytest`). `tests/__init__.py` and `conftest.py` add `bots/` and `bots/archive/` to `sys.path` so test modules can `import voidmaker` etc. by short name.
+- Replay / backtest harnesses are in `tools/`. They read CSVs from `market_data/` (gitignored).
 - Long-running processes on the VM should run inside `tmux` so they survive SSH drops.

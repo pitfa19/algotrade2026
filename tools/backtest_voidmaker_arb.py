@@ -17,8 +17,10 @@ import sys
 from collections import Counter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+BOTS = os.path.join(ROOT, "bots")
+for _p in (BOTS, ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from voidmaker import BookTop, find_cross_venue_arbs, select_close_exchanges
 

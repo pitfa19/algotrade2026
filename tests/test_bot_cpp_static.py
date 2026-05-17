@@ -4,8 +4,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BOT_CPP = ROOT / "bot.cpp"
-CMAKE = ROOT / "CMakeLists.txt"
+BOT_CPP = ROOT / "bots" / "cpp" / "bot.cpp"
+CMAKE = ROOT / "bots" / "cpp" / "CMakeLists.txt"
 
 
 class BotCppStaticTests(unittest.TestCase):

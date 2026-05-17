@@ -15,8 +15,10 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+BOTS = os.path.join(ROOT, "bots")
+for _p in (BOTS, ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from edge_max import CLOSE_EXCHANGES, ETF_BASKETS, split_instrument
 

@@ -11,7 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_ROOT = Path(__file__).resolve().parents[1]
+for _p in (_ROOT / "bots", _ROOT):
+    sys.path.insert(0, str(_p))
 
 import simple_mm_bot as bot
 
